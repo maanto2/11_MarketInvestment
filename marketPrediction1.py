@@ -206,6 +206,21 @@ def load_data_from_csv():
 # Load data at startup
 load_data_from_csv()
 
+def send_telegram_message(message, bot_token, chat_id):
+    """
+    Send a message to a Telegram chat using a bot.
+    Args:
+        message (str): The message to send.
+        bot_token (str): Telegram bot token.
+        chat_id (str): Telegram chat ID.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
+
 def update_data():
     """
     Periodically fetch new data, update predictions, retrain model, and save to CSV.
@@ -229,7 +244,7 @@ def update_data():
         save_data_to_csv()
 
         # Send Telegram alert if sentiment is sharply positive or negative
-        if abs(sentiment) >= 0.5:
+        if abs(sentiment) >= 0.6:
             direction = "POSITIVE" if sentiment > 0 else "NEGATIVE"
             message = f"Market sentiment is {direction} ({sentiment:.2f}) at {now.strftime('%Y-%m-%d %H:%M:%S')}! Consider short-term trading."
             send_telegram_message(message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
@@ -285,21 +300,6 @@ def update_graph(n):
 if __name__ == "__main__":
     threading.Thread(target=update_data, daemon=True).start()
     app.run(debug=True, port=8050)
-
-def send_telegram_message(message, bot_token, chat_id):
-    """
-    Send a message to a Telegram chat using a bot.
-    Args:
-        message (str): The message to send.
-        bot_token (str): Telegram bot token.
-        chat_id (str): Telegram chat ID.
-    """
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message}
-    try:
-        requests.post(url, data=payload, timeout=10)
-    except Exception as e:
-        print(f"Error sending Telegram message: {e}")
 
 
 
