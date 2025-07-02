@@ -19,8 +19,11 @@ import datetime as dt
 import threading
 import time
 import csv
+from keys import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-
+# Add your Telegram bot token and chat ID here
+TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN 
+TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID
 # ---------------- CONFIG -------------------
 
 # --------------- GLOBAL STORE --------------
@@ -205,13 +208,16 @@ load_data_from_csv()
 
 def update_data():
     """
-    Periodically fetch new data, update predictions, and save to CSV.
+    Periodically fetch new data, update predictions, retrain model, and save to CSV.
     """
+    global model_lstm, scaler_lstm
+    retrain_interval = 1440  # Retrain every 1440 cycles (once per day if loop runs every minute)
+    cycle_count = 0
     while True:
         hist = get_sp500_data_for_live()
         sentiment = fetch_sentiment_finbert()
         prediction_lstm = predict_lstm(model_lstm, scaler_lstm, hist)
-        prediction = prediction_lstm + sentiment * 10
+        prediction = prediction_lstm + sentiment * 0.1
 
         actual = hist["Close"].iloc[-1]
         now = dt.datetime.now()
@@ -222,10 +228,21 @@ def update_data():
         data_store["sentiment_score"].append(sentiment)
         save_data_to_csv()
 
-        # if abs(prediction - actual) > 10:
-        #     send_alert(prediction, actual)
+        # Send Telegram alert if sentiment is sharply positive or negative
+        if abs(sentiment) >= 0.5:
+            direction = "POSITIVE" if sentiment > 0 else "NEGATIVE"
+            message = f"Market sentiment is {direction} ({sentiment:.2f}) at {now.strftime('%Y-%m-%d %H:%M:%S')}! Consider short-term trading."
+            send_telegram_message(message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-        time.sleep(60)  # 5 min
+        cycle_count += 1
+        if cycle_count % retrain_interval == 0:
+            # Retrain the model with the latest data
+            print("Retraining LSTM model with latest data...")
+            hist_daily = get_sp500_data_for_lstm()
+            model_lstm, scaler_lstm = train_lstm_model(hist_daily)
+            print("Retraining complete.")
+
+        time.sleep(60)  # 1 min
 
 # ---------------- DASH APP ------------------
 app = Dash(__name__)
@@ -268,3 +285,21 @@ def update_graph(n):
 if __name__ == "__main__":
     threading.Thread(target=update_data, daemon=True).start()
     app.run(debug=True, port=8050)
+
+def send_telegram_message(message, bot_token, chat_id):
+    """
+    Send a message to a Telegram chat using a bot.
+    Args:
+        message (str): The message to send.
+        bot_token (str): Telegram bot token.
+        chat_id (str): Telegram chat ID.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
+
+
+
