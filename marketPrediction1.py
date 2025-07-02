@@ -31,8 +31,13 @@ data_store = {
     "actual": [],
     "predicted": [],
     "timestamps": [],
-    "sentiment_score": []
+    "sentiment_score": [],
+    "sentiment_summaries": []
 }
+
+tokenizer = BertTokenizer.from_pretrained('yiyanghkust/finbert-tone')
+model = BertForSequenceClassification.from_pretrained('yiyanghkust/finbert-tone')
+classifier = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
 
 # --------------- DATA FUNCTIONS ------------
 def get_sp500_data(interval='5m', period='7d'):
@@ -50,11 +55,11 @@ def get_sp500_data(interval='5m', period='7d'):
 
 def get_sp500_data_for_lstm():
     """
-    Get 5 years of daily S&P 500 data for LSTM model training.
+    Get 6 months of daily S&P 500 data for LSTM model training.
     Returns:
-        pd.DataFrame: Historical daily data for 5 years.
+        pd.DataFrame: Historical daily data for 6 months.
     """
-    return get_sp500_data(interval='1d', period='5y')
+    return get_sp500_data(interval='1m', period='7d')
 
 def get_sp500_data_for_live():
     """
@@ -68,59 +73,48 @@ def get_sp500_data_for_live():
 
 def fetch_sentiment_finbert():
     """
-    Fetch financial news headlines and compute average sentiment using FinBERT.
+    Fetch market sentiment from multiple news sources using FinBERT.
     Returns:
-        float: Average sentiment score (-1=Negative, 0=Neutral, 1=Positive).
+        tuple: (average_sentiment_score, summary_of_headlines)
     """
-
-    tokenizer = BertTokenizer.from_pretrained('yiyanghkust/finbert-tone')
-    model = BertForSequenceClassification.from_pretrained('yiyanghkust/finbert-tone')
-    classifier = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
-
-    news_sources = [
-        {
-            "url": "https://www.marketwatch.com/latest-news",
-            "tag": "h3"
-        },
-        {
-            "url": "https://www.reuters.com/markets/",
-            "tag": "h3"
-        },
-        {
-            "url": "https://www.cnbc.com/world/?region=world",
-            "tag": "a"  # CNBC headlines are often in <a> tags with class 'Card-title'
-        },
-        {
-            "url": "https://www.bloomberg.com/markets",
-            "tag": "h1"  # Bloomberg main headlines are in <h1>
-        },
-        {
-            "url": "https://www.ft.com/markets",
-            "tag": "a"  # FT headlines are often in <a> tags
-        }
-    ]
-
     headlines = []
     headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    news_sources = [
+        {"url": "https://www.marketwatch.com/latest-news", "tag": "h3"},
+        {"url": "https://www.reuters.com/markets/", "tag": "h3"},
+        {"url": "https://www.cnbc.com/world/?region=world", "tag": "a"},
+        {"url": "https://www.bloomberg.com/markets", "tag": "h1"},
+        {"url": "https://www.ft.com/markets", "tag": "a"},]
+    
     for source in news_sources:
         try:
             r = requests.get(source["url"], headers=headers, timeout=10)
             soup = BeautifulSoup(r.text, 'html.parser')
-            # For some sources, you may want to filter by class for more accuracy
             tags = soup.find_all(source["tag"], limit=5)
-            headlines += [tag.get_text(strip=True) for tag in tags]
+            headlines += [tag.get_text(strip=True) for tag in tags if tag.get_text(strip=True)]
         except Exception as e:
             print(f"Error fetching {source['url']}: {e}")
-
-    headlines = [h for h in headlines if h.strip()]  # Remove empty headlines
+            continue  # skip to next source
 
     if not headlines:
-        return 0  # or np.nan, or handle as you wish
+        print("No headlines found. Returning neutral sentiment (0).")
+        return 0.0, "No headlines found."
 
-    results = classifier(headlines)
-    score_map = {'Positive': 1, 'Neutral': 0, 'Negative': -1}
-    scores = [score_map[r['label']] for r in results]
-    return np.mean(scores)
+    try:
+        results = classifier(headlines)
+        score_map = {'Positive': 1, 'Neutral': 0, 'Negative': -1}
+        scores = [score_map[r['label']] for r in results]
+        # Compose a short summary of the most influential headlines
+        summary = []
+        for h, r in zip(headlines, results):
+            if r['label'] != 'Neutral':
+                summary.append(f"{r['label']}: {h}")
+        summary_text = '\n'.join(summary[:3]) if summary else 'No strong sentiment detected.'
+        return np.mean(scores), summary_text
+    except Exception as e:
+        print(f"Error during sentiment classification: {e}")
+        return 0.0, "Sentiment classification error."
 
 # --------------- LSTM MODEL -----------------
 def train_lstm_model(hist):
@@ -152,7 +146,7 @@ def train_lstm_model(hist):
         Dense(1)
     ])
     model.compile(optimizer='adam', loss='mse')
-    model.fit(X, y, epochs=5, batch_size=32, verbose=0)
+    model.fit(X, y, epochs=30, batch_size=64, verbose=0)
 
     return model, scaler
 
@@ -182,13 +176,20 @@ model_lstm, scaler_lstm = train_lstm_model(hist_daily)
 
 def save_data_to_csv():
     """
-    Save the current dashboard data to a CSV file.
+    Append the latest data point to CSV.
     """
-    with open('dashboard_data.csv', 'w', newline='') as csvfile:
+    file_exists = os.path.isfile('dashboard_data.csv')
+    with open('dashboard_data.csv', 'a', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
-        for t, a, p, s in zip(data_store['timestamps'], data_store['actual'], data_store['predicted'], data_store['sentiment_score']):
-            writer.writerow([t, a, p, s])
+        if not file_exists:
+            writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
+        if data_store['timestamps']:
+            writer.writerow([
+                data_store['timestamps'][-1],
+                data_store['actual'][-1],
+                data_store['predicted'][-1],
+                data_store['sentiment_score'][-1]
+            ])
 
 def load_data_from_csv():
     """
@@ -222,42 +223,49 @@ def send_telegram_message(message, bot_token, chat_id):
         print(f"Error sending Telegram message: {e}")
 
 def update_data():
-    """
-    Periodically fetch new data, update predictions, retrain model, and save to CSV.
-    """
     global model_lstm, scaler_lstm
-    retrain_interval = 1440  # Retrain every 1440 cycles (once per day if loop runs every minute)
+    retrain_interval = 1440
     cycle_count = 0
     while True:
-        hist = get_sp500_data_for_live()
-        sentiment = fetch_sentiment_finbert()
-        prediction_lstm = predict_lstm(model_lstm, scaler_lstm, hist)
-        prediction = prediction_lstm + sentiment * 0.1
+        try:
+            hist = get_sp500_data_for_live()
+            sentiment, sentiment_summary = fetch_sentiment_finbert()
+            prediction_lstm = predict_lstm(model_lstm, scaler_lstm, hist)
+            sentiment_weight = (hist['Close'].iloc[-1] * 0.005)
+            prediction = prediction_lstm + sentiment * sentiment_weight
 
-        actual = hist["Close"].iloc[-1]
-        now = dt.datetime.now()
+            actual = hist["Close"].iloc[-1]
+            now = dt.datetime.now()
 
-        data_store["timestamps"].append(now)
-        data_store["actual"].append(actual)
-        data_store["predicted"].append(prediction)
-        data_store["sentiment_score"].append(sentiment)
-        save_data_to_csv()
+            # Predict for the next minute and store it with a placeholder for actual
+            next_timestamp = now + dt.timedelta(minutes=1)
+            data_store["timestamps"].append(next_timestamp)
+            data_store["predicted"].append(prediction)
+            data_store["actual"].append(None)  # Placeholder for actual value
+            data_store["sentiment_score"].append(sentiment)
+            data_store["sentiment_summaries"].append(sentiment_summary)
+            save_data_to_csv()
 
-        # Send Telegram alert if sentiment is sharply positive or negative
-        if abs(sentiment) >= 0.6:
-            direction = "POSITIVE" if sentiment > 0 else "NEGATIVE"
-            message = f"Market sentiment is {direction} ({sentiment:.2f}) at {now.strftime('%Y-%m-%d %H:%M:%S')}! Consider short-term trading."
-            send_telegram_message(message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+            # On the next loop, update the last None with the actual value
+            if data_store["actual"][-2] is None:
+                data_store["actual"][-2] = actual
+                save_data_to_csv()
 
-        cycle_count += 1
-        if cycle_count % retrain_interval == 0:
-            # Retrain the model with the latest data
-            print("Retraining LSTM model with latest data...")
-            hist_daily = get_sp500_data_for_lstm()
-            model_lstm, scaler_lstm = train_lstm_model(hist_daily)
-            print("Retraining complete.")
+            if abs(sentiment) >= 0.6:
+                direction = "POSITIVE" if sentiment > 0 else "NEGATIVE"
+                message = f"Market sentiment is {direction} ({sentiment:.2f}) at {now.strftime('%Y-%m-%d %H:%M:%S')}! Consider short-term trading."
+                send_telegram_message(message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-        time.sleep(60)  # 1 min
+            cycle_count += 1
+            if cycle_count % retrain_interval == 0:
+                print("Retraining LSTM model with latest data...")
+                hist_daily = get_sp500_data_for_lstm()
+                model_lstm, scaler_lstm = train_lstm_model(hist_daily)
+                print("Retraining complete.")
+
+        except Exception as e:
+            print(f"[Update Thread Error] {e}")
+        time.sleep(60)
 
 # ---------------- DASH APP ------------------
 app = Dash(__name__)
@@ -266,35 +274,36 @@ app.title = "S&P 500 Prediction Dashboard"
 app.layout = html.Div([
     html.H1("Live S&P 500 Prediction Dashboard"),
     dcc.Graph(id='trend-graph'),
+    html.Div(id='sentiment-summary', style={'whiteSpace': 'pre-line', 'margin': '20px', 'fontSize': '16px', 'color': '#FFD700'}),
     dcc.Interval(id='interval', interval=60*1000, n_intervals=0)
 ])
 
 @app.callback(
-    Output('trend-graph', 'figure'),
+    [Output('trend-graph', 'figure'), Output('sentiment-summary', 'children')],
     [Input('interval', 'n_intervals')]
 )
 def update_graph(n):
-    """
-    Dash callback to update the trend graph with actual and predicted values.
-    Args:
-        n (int): Number of intervals elapsed (not used).
-    Returns:
-        plotly.graph_objs.Figure: Updated graph figure.
-    """
     if len(data_store["timestamps"]) == 0:
-        return go.Figure()
+        return go.Figure(), ""
+
+    window = 5
+    predicted_smoothed = pd.Series(data_store["predicted"]).rolling(window, min_periods=1).mean()
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["actual"],
-                             mode='lines+markers', name='Actual'))
-    fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["predicted"],
-                             mode='lines+markers', name='Predicted'))
+                             mode='lines+markers', name='Actual Price'))
+    fig.add_trace(go.Scatter(x=data_store["timestamps"], y=predicted_smoothed,
+                             mode='lines+markers', name='Predicted (Smoothed)'))
 
-    fig.update_layout(title='S&P 500 Actual vs Predicted Every 5 Minutes',
+    fig.update_layout(title='S&P 500 Actual vs Predicted (Smoothed) Every 5 Minutes',
                       xaxis_title='Timestamp',
                       yaxis_title='Price',
                       template='plotly_dark')
-    return fig
+
+    # Show the latest sentiment summary
+    sentiment_summary = data_store.get('sentiment_summaries', [])
+    summary_text = sentiment_summary[-1] if sentiment_summary else "No sentiment summary available."
+    return fig, summary_text
 
 # ----------------- RUN ----------------------
 if __name__ == "__main__":
