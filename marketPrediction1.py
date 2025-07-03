@@ -19,8 +19,6 @@ import datetime as dt
 import threading
 import time
 import csv
-import pytz
-from datetime import datetime, time as dtime
 from keys import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # Add your Telegram bot token and chat ID here
@@ -33,8 +31,7 @@ data_store = {
     "actual": [],
     "predicted": [],
     "timestamps": [],
-    "sentiment_score": [],
-    "sentiment_summaries": []
+    "sentiment_score": []
 }
 
 tokenizer = BertTokenizer.from_pretrained('yiyanghkust/finbert-tone')
@@ -74,11 +71,7 @@ def get_sp500_data_for_live():
 # --------------- SENTIMENT (LLM) ------------
 
 def fetch_sentiment_finbert():
-    """
-    Fetch market sentiment from multiple news sources using FinBERT.
-    Returns:
-        tuple: (average_sentiment_score, summary_of_headlines)
-    """
+    ...
     headlines = []
     headers = {'User-Agent': 'Mozilla/5.0'}
     
@@ -101,22 +94,16 @@ def fetch_sentiment_finbert():
 
     if not headlines:
         print("No headlines found. Returning neutral sentiment (0).")
-        return 0.0, "No headlines found."
+        return 0.0
 
     try:
         results = classifier(headlines)
         score_map = {'Positive': 1, 'Neutral': 0, 'Negative': -1}
         scores = [score_map[r['label']] for r in results]
-        # Compose a short summary of the most influential headlines
-        summary = []
-        for h, r in zip(headlines, results):
-            if r['label'] != 'Neutral':
-                summary.append(f"{r['label']}: {h}")
-        summary_text = '\n'.join(summary[:3]) if summary else 'No strong sentiment detected.'
-        return np.mean(scores), summary_text
+        return np.mean(scores)
     except Exception as e:
         print(f"Error during sentiment classification: {e}")
-        return 0.0, "Sentiment classification error."
+        return 0.0
 
 # --------------- LSTM MODEL -----------------
 def train_lstm_model(hist):
@@ -178,14 +165,12 @@ model_lstm, scaler_lstm = train_lstm_model(hist_daily)
 
 def save_data_to_csv():
     """
-    Append the latest data point to CSV.
+    Save the entire dashboard data to a CSV file, including all actual values.
     """
     file_exists = os.path.isfile('dashboard_data.csv')
-    with open('dashboard_data.csv', 'a', newline='') as csvfile:
+    with open('dashboard_data.csv', 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        if not file_exists:
-            writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
-        # Write all rows, not just the last one
+        writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
         for t, a, p, s in zip(data_store['timestamps'], data_store['actual'], data_store['predicted'], data_store['sentiment_score']):
             writer.writerow([t, a, p, s])
 
@@ -194,16 +179,13 @@ def load_data_from_csv():
     Load dashboard data from a CSV file into the data_store.
     """
     try:
-        df = pd.read_csv('dashboard_data.csv')  # assumes header row exists
-        if df['timestamp'].iloc[0] == 'timestamp':
-            df = df.iloc[1:]  # skip header row if duplicated as data
-        df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S.%f', errors='coerce')
+        df = pd.read_csv('dashboard_data.csv', parse_dates=['timestamp'])
         data_store['timestamps'] = list(df['timestamp'])
         data_store['actual'] = list(df['actual'])
         data_store['predicted'] = list(df['predicted'])
         data_store['sentiment_score'] = list(df['sentiment_score'])
-    except Exception as e:
-        print(f"[CSV Load Error] {e}")
+    except Exception:
+        pass
 
 # Load data at startup
 load_data_from_csv()
@@ -227,62 +209,45 @@ def update_data():
     global model_lstm, scaler_lstm
     retrain_interval = 1440
     cycle_count = 0
-    after_hours_sentiment = 0.0
-    after_hours_summary = ""
     while True:
-        start_time = time.time()
         try:
-            if is_market_open():
-                hist = get_sp500_data_for_live()
-                sentiment, sentiment_summary = fetch_sentiment_finbert()
-                # Add after-hours sentiment to today's sentiment if available
-                sentiment += after_hours_sentiment
-                prediction_lstm = predict_lstm(model_lstm, scaler_lstm, hist)
-                sentiment_weight = (hist['Close'].iloc[-1] * 0.005)
-                prediction = prediction_lstm + sentiment * sentiment_weight
+            hist = get_sp500_data_for_live()
+            sentiment = fetch_sentiment_finbert()
+            prediction_lstm = predict_lstm(model_lstm, scaler_lstm, hist)
+            sentiment_weight = (hist['Close'].iloc[-1] * 0.005)
+            prediction = prediction_lstm + sentiment * sentiment_weight
 
-                actual = hist["Close"].iloc[-1]
-                now = dt.datetime.now()
+            actual = hist["Close"].iloc[-1]
+            now = dt.datetime.now()
 
-                # Predict for the next minute and store it with a placeholder for actual
-                next_timestamp = now + dt.timedelta(minutes=1)
-                data_store["timestamps"].append(next_timestamp)
-                data_store["predicted"].append(prediction)
-                data_store["actual"].append(None)  # Placeholder for actual value
-                data_store["sentiment_score"].append(sentiment)
-                data_store["sentiment_summaries"].append(sentiment_summary)
+            # Predict for the next minute and store it with a placeholder for actual
+            next_timestamp = now + dt.timedelta(minutes=1)
+            data_store["timestamps"].append(next_timestamp)
+            data_store["predicted"].append(prediction)
+            data_store["actual"].append(None)  # Placeholder for actual value
+            data_store["sentiment_score"].append(sentiment)
+            save_data_to_csv()
+
+            # On the next loop, update the last None with the actual value
+            if len(data_store["actual"]) > 1 and data_store["actual"][-2] is None:
+                data_store["actual"][-2] = actual
                 save_data_to_csv()
 
-                # On the next loop, update the last None with the actual value
-                if len(data_store["actual"]) > 1 and data_store["actual"][-2] is None:
-                    data_store["actual"][-2] = actual
-                    save_data_to_csv()
+            if abs(sentiment) >= 0.6:
+                direction = "POSITIVE" if sentiment > 0 else "NEGATIVE"
+                message = f"Market sentiment is {direction} ({sentiment:.2f}) at {now.strftime('%Y-%m-%d %H:%M:%S')}! Consider short-term trading."
+                send_telegram_message(message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-                if abs(sentiment) >= 0.6:
-                    direction = "POSITIVE" if sentiment > 0 else "NEGATIVE"
-                    message = f"Market sentiment is {direction} ({sentiment:.2f}) at {now.strftime('%Y-%m-%d %H:%M:%S')}! Consider short-term trading."
-                    send_telegram_message(message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+            cycle_count += 1
+            if cycle_count % retrain_interval == 0:
+                print("Retraining LSTM model with latest data...")
+                hist_daily = get_sp500_data_for_lstm()
+                model_lstm, scaler_lstm = train_lstm_model(hist_daily)
+                print("Retraining complete.")
 
-                cycle_count += 1
-                if cycle_count % retrain_interval == 0:
-                    print("Retraining LSTM model with latest data...")
-                    hist_daily = get_sp500_data_for_lstm()
-                    model_lstm, scaler_lstm = train_lstm_model(hist_daily)
-                    print("Retraining complete.")
-            else:
-                # After-hours: do in-depth S&P 500 component analysis
-                after_hours_summary, after_hours_sentiment = analyze_sp500_components()
-                print("[After Hours Research]", after_hours_summary)
-                # Optionally, update dashboard with after-hours summary
-                data_store["sentiment_summaries"].append("After Hours Research:\n" + after_hours_summary)
-                save_data_to_csv()
-                time.sleep(300)  # Sleep 5 minutes during after-hours
-                continue
         except Exception as e:
             print(f"[Update Thread Error] {e}")
-        elapsed = time.time() - start_time
-        print(f"[Cycle Runtime] {elapsed:.2f} seconds")
-        time.sleep(max(0, 60 - elapsed))
+        time.sleep(60)
 
 # ---------------- DASH APP ------------------
 app = Dash(__name__)
@@ -291,79 +256,44 @@ app.title = "S&P 500 Prediction Dashboard"
 app.layout = html.Div([
     html.H1("Live S&P 500 Prediction Dashboard"),
     dcc.Graph(id='trend-graph'),
-    html.Div(id='sentiment-summary', style={'whiteSpace': 'pre-line', 'margin': '20px', 'fontSize': '16px', 'color': '#FFD700'}),
     dcc.Interval(id='interval', interval=60*1000, n_intervals=0)
 ])
 
 @app.callback(
-    [Output('trend-graph', 'figure'), Output('sentiment-summary', 'children')],
+    Output('trend-graph', 'figure'),
     [Input('interval', 'n_intervals')]
 )
 def update_graph(n):
     if len(data_store["timestamps"]) == 0:
-        return go.Figure(), ""
+        return go.Figure()
 
     window = 5
     predicted_smoothed = pd.Series(data_store["predicted"]).rolling(window, min_periods=1).mean()
 
+    # Filter out None values for actuals
+    actual_filtered = [a for a in data_store["actual"] if a is not None]
+    timestamps_filtered = [t for a, t in zip(data_store["actual"], data_store["timestamps"]) if a is not None]
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["actual"],
+    fig.add_trace(go.Scatter(x=timestamps_filtered, y=actual_filtered,
                              mode='lines+markers', name='Actual Price'))
     fig.add_trace(go.Scatter(x=data_store["timestamps"], y=predicted_smoothed,
                              mode='lines+markers', name='Predicted (Smoothed)'))
+    fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["sentiment_score"],
+                             mode='lines+markers', name='Sentiment Score', yaxis='y2'))
 
-    fig.update_layout(title='S&P 500 Actual vs Predicted (Smoothed) Every 5 Minutes',
-                      xaxis_title='Timestamp',
-                      yaxis_title='Price',
-                      template='plotly_dark')
+    fig.update_layout(
+        title='S&P 500 Actual vs Predicted with Sentiment',
+        xaxis_title='Timestamp',
+        yaxis_title='Price',
+        yaxis2=dict(title='Sentiment', overlaying='y', side='right', showgrid=False),
+        template='plotly_dark'
+    )
+    return fig
 
-    # Show the latest sentiment summary
-    sentiment_summary = data_store.get('sentiment_summaries', [])
-    summary_text = sentiment_summary[-1] if sentiment_summary else "No sentiment summary available."
-    return fig, summary_text
-
-# S&P 500 market hours (Eastern Time)
-def is_market_open():
-    eastern = pytz.timezone('US/Eastern')
-    now_et = datetime.now(eastern)
-    is_weekday = now_et.weekday() < 5
-    open_time = dtime(9, 30)
-    close_time = dtime(16, 0)
-    return is_weekday and open_time <= now_et.time() <= close_time
-
-# Get S&P 500 tickers (static list for demo, can be fetched from Wikipedia or yfinance)
-SP500_TICKERS = [
-    # ... (add a subset for demo, or fetch dynamically for full list)
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'BRK-B', 'NVDA', 'JPM', 'V', 'UNH', 'HD', 'PG', 'MA', 'DIS', 'BAC', 'VZ', 'ADBE', 'CMCSA', 'NFLX', 'KO', 'PFE', 'T', 'CSCO', 'PEP', 'ABT', 'CRM', 'XOM', 'CVX', 'WMT', 'INTC', 'MCD', 'MDT', 'COST', 'DHR', 'NKE', 'LLY', 'TMO', 'NEE', 'TXN', 'LIN', 'UNP', 'HON', 'PM', 'ORCL', 'AMGN', 'QCOM', 'IBM', 'ACN', 'AVGO', 'LOW', 'SBUX', 'MMM', 'GE', 'CAT', 'GS', 'BLK', 'AXP', 'SPGI', 'PLD', 'ISRG', 'MDLZ', 'CB', 'AMT', 'SYK', 'GILD', 'ZTS', 'CI', 'DE', 'DUK', 'MMC', 'ADI', 'C', 'SO', 'USB', 'PNC', 'TGT', 'BDX', 'CL', 'SHW', 'ICE', 'APD', 'ITW', 'MO', 'BKNG', 'FIS', 'ADP', 'EW', 'VRTX', 'REGN', 'AON', 'ETN', 'ECL', 'NSC', 'FDX', 'EMR', 'PSA', 'AIG', 'HUM', 'PSX', 'D', 'AEP', 'ALL', 'AFL', 'A', 'BAX', 'BMY', 'COF', 'DOV', 'EOG', 'EXC', 'F', 'GM', 'HCA', 'KMB', 'LHX', 'LMT', 'MET', 'MS', 'MTB', 'NOC', 'PGR', 'PRU', 'RF', 'RMD', 'SRE', 'STT', 'TFC', 'TRV', 'VLO', 'WBA', 'WELL', 'WMB', 'WST', 'ZBH'
-]
-
-def analyze_sp500_components():
-    """
-    Fetch and analyze all S&P 500 components for after-hours research.
-    Returns a summary string for dashboard and a numeric score for next day sentiment.
-    """
-    try:
-        data = yf.download(SP500_TICKERS, period='1d', group_by='ticker', threads=True)
-        gainers = []
-        losers = []
-        sector_perf = {}
-        for ticker in SP500_TICKERS:
-            try:
-                close = data[ticker]['Close'].iloc[-1]
-                open_ = data[ticker]['Open'].iloc[-1]
-                change = (close - open_) / open_ * 100
-                if change > 2:
-                    gainers.append(f"{ticker} (+{change:.2f}%)")
-                elif change < -2:
-                    losers.append(f"{ticker} ({change:.2f}%)")
-            except Exception:
-                continue
-        summary = f"Top Gainers: {', '.join(gainers[:5])}\nTop Losers: {', '.join(losers[:5])}"
-        # Simple sentiment: more gainers = positive, more losers = negative
-        score = (len(gainers) - len(losers)) / len(SP500_TICKERS)
-        return summary, score
-    except Exception as e:
-        return f"[SP500 Analysis Error] {e}", 0.0
-
+# ----------------- RUN ----------------------
+if __name__ == "__main__":
+    threading.Thread(target=update_data, daemon=True).start()
+    app.run(debug=True, port=8050)
 
 
