@@ -25,6 +25,7 @@ from datetime import datetime, time as dtime
 from fredapi import Fred
 import functools
 import logging
+import concurrent.futures
 
 # Add your Telegram bot token and chat ID here
 TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN 
@@ -82,17 +83,29 @@ def get_sp500_data_for_live():
 # --------------- SENTIMENT (LLM) ------------
 
 def fetch_sentiment_finbert():
-    ...
     headlines = []
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     news_sources = [
+        # US/global
         {"url": "https://www.marketwatch.com/latest-news", "tag": "h3"},
         {"url": "https://www.reuters.com/markets/", "tag": "h3"},
         {"url": "https://www.cnbc.com/world/?region=world", "tag": "a"},
         {"url": "https://www.bloomberg.com/markets", "tag": "h1"},
-        {"url": "https://www.ft.com/markets", "tag": "a"},]
-    
+        {"url": "https://www.ft.com/markets", "tag": "a"},
+        # China/Asia
+        {"url": "https://www.scmp.com/business/china-business", "tag": "a"},
+        {"url": "https://asia.nikkei.com/Business/Markets", "tag": "a"},
+        {"url": "https://www.caixinglobal.com/markets/", "tag": "a"},
+        {"url": "https://www.reuters.com/markets/asia/", "tag": "h3"},
+    ]
+    # Major Chinese companies (Yahoo Finance news pages)
+    chinese_companies = ["BABA", "TCEHY", "JD", "BIDU", "NIO", "PDD", "LI", "XPEV"]
+    for ticker in chinese_companies:
+        news_sources.append({
+            "url": f"https://finance.yahoo.com/quote/{ticker}/news", "tag": "h3"
+        })
+
     for source in news_sources:
         try:
             r = requests.get(source["url"], headers=headers, timeout=10)
@@ -309,9 +322,20 @@ app.title = "S&P 500 Prediction Dashboard"
 
 app.layout = html.Div([
     html.H1("Live S&P 500 Prediction Dashboard"),
+    html.Div(id='market-status-banner', style={'backgroundColor': '#222', 'color': 'yellow', 'padding': '8px', 'fontWeight': 'bold', 'fontSize': '18px', 'overflowX': 'auto', 'whiteSpace': 'nowrap'}),
     dcc.Graph(id='trend-graph'),
     dcc.Interval(id='interval', interval=60*1000, n_intervals=0)
 ])
+
+@app.callback(
+    Output('market-status-banner', 'children'),
+    [Input('interval', 'n_intervals')]
+)
+def update_market_status(n):
+    if is_market_open():
+        return '🟢 Market is OPEN'
+    else:
+        return '🔴 Market is CLOSED'
 
 @app.callback(
     Output('trend-graph', 'figure'),
@@ -357,7 +381,14 @@ def analyze_sp500_components():
     Returns a summary string for dashboard and a numeric score for next day sentiment.
     """
     try:
-        data = yf.download(SP500_TICKERS, period='1d', group_by='ticker', threads=True)
+        # Reduce frequency: cache data for 10 minutes
+        if not hasattr(analyze_sp500_components, '_last_fetch') or \
+           (time.time() - getattr(analyze_sp500_components, '_last_fetch', 0)) > 600:
+            analyze_sp500_components._cached_data = yf.download(
+                SP500_TICKERS, period='1d', group_by='ticker', threads=True, progress=False, auto_adjust=False
+            )
+            analyze_sp500_components._last_fetch = time.time()
+        data = analyze_sp500_components._cached_data
         gainers = []
         losers = []
         for ticker in SP500_TICKERS:
@@ -418,37 +449,32 @@ def analyze_sp500_detailed_parallel():
 
 # ----------------- MACROECONOMIC & MARKET FACTORS FETCHERS -----------------
 def fetch_gdp_data():
-    """
-    Fetch latest GDP data from a reliable source (e.g., FRED, World Bank API).
-    Returns:
-        float or dict: Latest GDP value or structured GDP data.
-    """
-    @profile_time
-    def inner():
-        try:
-            gdp = fred.get_series_latest_release('GDP')
-            return float(gdp) if gdp is not None else None
-        except Exception as e:
-            print(f"[GDP Fetch Error] {e}")
+    try:
+        gdp = fred.get_series_latest_release('GDP')
+        if gdp is not None and hasattr(gdp, 'iloc') and not gdp.empty:
+            return float(gdp.iloc[-1])
+        elif isinstance(gdp, (float, int)):
+            return float(gdp)
+        else:
+            print("[GDP Fetch Error] No valid GDP data returned.")
             return None
-    return inner()
+    except Exception as e:
+        print(f"[GDP Fetch Error] {e}")
+        return None
 
 def fetch_inflation_data():
-    """
-    Fetch latest inflation data (e.g., CPI) from a reliable source.
-    Returns:
-        float or dict: Latest inflation value or structured data.
-    """
-    @profile_time
-    def inner():
-        try:
-            cpi = fred.get_series_latest_release('CPIAUCSL')
-            return float(cpi) if cpi is not None else None
-        except Exception as e:
-            print(f"[Inflation Fetch Error] {e}")
+    try:
+        cpi = fred.get_series_latest_release('CPIAUCSL')
+        if cpi is not None and hasattr(cpi, 'iloc') and not cpi.empty:
+            return float(cpi.iloc[-1])
+        elif isinstance(cpi, (float, int)):
+            return float(cpi)
+        else:
+            print("[Inflation Fetch Error] No valid CPI data returned.")
             return None
-    return inner()
-
+    except Exception as e:
+        print(f"[Inflation Fetch Error] {e}")
+        return None
 # Fed Policy (scrape Federal Reserve news headlines)
 def fetch_fed_policy_data():
     try:
@@ -491,9 +517,22 @@ def fetch_earnings_season_data():
         headers = {'User-Agent': 'Mozilla/5.0'}
         r = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(r.text, 'html.parser')
-        # Find summary stats (e.g., number of beats/misses)
-        summary = soup.find('section', {'data-test': 'earnings-summary'}).get_text(strip=True)
-        return {'summary': summary}
+        section = soup.find('section', {'data-test': 'earnings-summary'})
+        if section:
+            summary = section.get_text(strip=True)
+            return {'summary': summary}
+        # Fallback: try to get the first table or headline if section is missing
+        table = soup.find('table')
+        if table:
+            rows = table.find_all('tr')
+            if rows:
+                first_row = ' | '.join([td.get_text(strip=True) for td in rows[0].find_all('td')])
+                return {'summary': f"Earnings table (first row): {first_row}"}
+        headline = soup.find('h1')
+        if headline:
+            return {'summary': headline.get_text(strip=True)}
+        print("[Earnings Fetch Error] Earnings summary section and fallback not found.")
+        return None
     except Exception as e:
         print(f"[Earnings Fetch Error] {e}")
         return None
@@ -518,17 +557,13 @@ def fetch_bond_yields_data():
     Returns:
         float or dict: Bond yield value(s).
     """
-    @profile_time
-    def inner():
-        try:
-            # Example: 10-Year Treasury Constant Maturity Rate
-            yield_10y = fred.get_series_latest_release('DGS10')
-            return float(yield_10y) if yield_10y is not None else None
-        except Exception as e:
-            print(f"[Bond Yield Fetch Error] {e}")
-            return None
-    return inner()
-
+    try:
+        # Example: 10-Year Treasury Constant Maturity Rate
+        yield_10y = fred.get_series_latest_release('DGS10')
+        return float(yield_10y) if yield_10y is not None else None
+    except Exception as e:
+        print(f"[Bond Yield Fetch Error] {e}")
+        return None
 def fetch_commodities_data():
     try:
         # Gold: 'GC=F', Oil: 'CL=F'
@@ -551,26 +586,33 @@ def fetch_currency_data():
 # ----------------- AGGREGATION FUNCTION -----------------
 def aggregate_macro_factors():
     """
-    Aggregate all macroeconomic and market factors into a single dictionary for analysis.
+    Aggregate all macroeconomic and market factors into a single dictionary for analysis, in parallel.
     Returns:
         dict: Aggregated macro/market data.
     """
-    start = time.perf_counter()
-    result = {
-        'gdp': fetch_gdp_data(),
-        'inflation': fetch_inflation_data(),
-        'fed_policy': fetch_fed_policy_data(),
-        'global_events': fetch_global_events_data(),
-        'sector_performance': fetch_sector_performance_data(),
-        'bond_yields': fetch_bond_yields_data(),
-        'commodities': fetch_commodities_data(),
-        'currency': fetch_currency_data(),
-        'government_policy': fetch_government_policy_data(),
-        'earnings_season': fetch_earnings_season_data(),
+    fetchers = {
+        'gdp': fetch_gdp_data,
+        'inflation': fetch_inflation_data,
+        'fed_policy': fetch_fed_policy_data,
+        'global_events': fetch_global_events_data,
+        'sector_performance': fetch_sector_performance_data,
+        'bond_yields': fetch_bond_yields_data,
+        'commodities': fetch_commodities_data,
+        'currency': fetch_currency_data,
+        'government_policy': fetch_government_policy_data,
+        'earnings_season': fetch_earnings_season_data,
     }
-    elapsed = time.perf_counter() - start
-    logging.info(f"aggregate_macro_factors took {elapsed:.3f} seconds")
-    return result
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
+        future_to_key = {executor.submit(fn): key for key, fn in fetchers.items()}
+        for future in concurrent.futures.as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                results[key] = None
+                print(f"[aggregate_macro_factors] Error fetching {key}: {e}")
+    return results
 
 # Setup logging for profiling
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
