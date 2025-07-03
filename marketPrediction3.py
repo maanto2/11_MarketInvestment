@@ -129,6 +129,115 @@ def fetch_sentiment_finbert():
         print(f"Error during sentiment classification: {e}")
         return 0.0
 
+# Caching decorator for slow/rarely-changing sources
+def cache_result(ttl_seconds=600):
+    def decorator(func):
+        cache = {}
+        def wrapper(*args, **kwargs):
+            now = time.time()
+            if 'value' in cache and (now - cache['time'] < ttl_seconds):
+                return cache['value']
+            value = func(*args, **kwargs)
+            cache['value'] = value
+            cache['time'] = now
+            return value
+        return wrapper
+    return decorator
+
+# Apply caching to slow/rarely-changing sources
+@cache_result(ttl_seconds=1800)  # 30 minutes
+def fetch_sector_performance_data():
+    try:
+        # Select Sector SPDR ETFs (XLF, XLK, XLE, etc.)
+        sector_etfs = ['XLF', 'XLK', 'XLE', 'XLV', 'XLY', 'XLI', 'XLC', 'XLRE', 'XLU', 'XLB', 'XLP']
+        sector_perf = {}
+        for etf in sector_etfs:
+            hist = yf.Ticker(etf).history(period='5d')
+            perf = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
+            sector_perf[etf] = perf
+        return sector_perf
+    except Exception as e:
+        print(f"[Sector Performance Fetch Error] {e}")
+        return None
+
+@cache_result(ttl_seconds=1800)  # 30 minutes
+def fetch_earnings_season_data():
+    try:
+        url = 'https://finance.yahoo.com/calendar/earnings/'
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        section = soup.find('section', {'data-test': 'earnings-summary'})
+        if section:
+            summary = section.get_text(strip=True)
+            return {'summary': summary}
+        # Fallback: try to get the first table or headline if section is missing
+        table = soup.find('table')
+        if table:
+            rows = table.find_all('tr')
+            if rows:
+                first_row = ' | '.join([td.get_text(strip=True) for td in rows[0].find_all('td')])
+                return {'summary': f"Earnings table (first row): {first_row}"}
+        headline = soup.find('h1')
+        if headline:
+            return {'summary': headline.get_text(strip=True)}
+        print("[Earnings Fetch Error] Earnings summary section and fallback not found.")
+        return None
+    except Exception as e:
+        print(f"[Earnings Fetch Error] {e}")
+        return None
+
+@cache_result(ttl_seconds=1800)  # 30 minutes
+
+def fetch_sentiment_china_news():
+    """
+    Fetch and analyze sentiment from China/Asia news and major Chinese companies (for caching).
+    Returns a sentiment score.
+    """
+    headlines = []
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    news_sources = [
+        {"url": "https://www.scmp.com/business/china-business", "tag": "a"},
+        {"url": "https://asia.nikkei.com/Business/Markets", "tag": "a"},
+        {"url": "https://www.caixinglobal.com/markets/", "tag": "a"},
+        {"url": "https://www.reuters.com/markets/asia/", "tag": "h3"},
+    ]
+    # Major Chinese companies (Yahoo Finance news pages)
+    chinese_companies = ["BABA", "TCEHY", "JD", "BIDU", "NIO", "PDD", "LI", "XPEV"]
+    for ticker in chinese_companies:
+        news_sources.append({
+            "url": f"https://finance.yahoo.com/quote/{ticker}/news", "tag": "h3"
+        })
+    for source in news_sources:
+        try:
+            r = requests.get(source["url"], headers=headers, timeout=10)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            tags = soup.find_all(source["tag"], limit=5)
+            headlines += [tag.get_text(strip=True) for tag in tags if tag.get_text(strip=True)]
+        except Exception as e:
+            print(f"Error fetching {source['url']}: {e}")
+            continue
+    if not headlines:
+        print("No China/Asia headlines found. Returning neutral sentiment (0).")
+        return 0.0
+    try:
+        results = classifier(headlines)
+        score_map = {'Positive': 1, 'Neutral': 0, 'Negative': -1}
+        scores = [score_map[r['label']] for r in results]
+        return np.mean(scores)
+    except Exception as e:
+        print(f"Error during China sentiment classification: {e}")
+        return 0.0
+
+# In fetch_sentiment_finbert, call fetch_sentiment_china_news() and combine with global sentiment
+old_fetch_sentiment_finbert = fetch_sentiment_finbert
+
+def fetch_sentiment_finbert():
+    global_sentiment = old_fetch_sentiment_finbert()
+    china_sentiment = fetch_sentiment_china_news()
+    # Weighted average: 70% global, 30% China/Asia
+    return 0.7 * global_sentiment + 0.3 * china_sentiment
+
 # --------------- LSTM MODEL -----------------
 def train_lstm_model(hist):
     """
@@ -583,10 +692,59 @@ def fetch_currency_data():
         print(f"[Currency Fetch Error] {e}")
         return None
 
-# ----------------- AGGREGATION FUNCTION -----------------
+def fetch_volatility_and_global_features():
+    """
+    Fetch S&P 500 futures, VIX, and major global indices for open prediction features.
+    Returns:
+        dict: {'spx_futures': float, 'vix': float, 'nikkei': float, 'dax': float, ...}
+    """
+    try:
+        features = {}
+        # S&P 500 E-mini Futures (CME): 'ES=F'
+        try:
+            features['spx_futures'] = float(yf.Ticker('ES=F').history(period='1d')['Close'].iloc[-1])
+        except Exception as e:
+            print(f"[Futures Fetch Error] {e}")
+            features['spx_futures'] = None
+        # VIX Volatility Index: '^VIX'
+        try:
+            features['vix'] = float(yf.Ticker('^VIX').history(period='1d')['Close'].iloc[-1])
+        except Exception as e:
+            print(f"[VIX Fetch Error] {e}")
+            features['vix'] = None
+        # Nikkei 225: '^N225'
+        try:
+            features['nikkei'] = float(yf.Ticker('^N225').history(period='1d')['Close'].iloc[-1])
+        except Exception as e:
+            print(f"[Nikkei Fetch Error] {e}")
+            features['nikkei'] = None
+        # DAX (Germany): '^GDAXI'
+        try:
+            features['dax'] = float(yf.Ticker('^GDAXI').history(period='1d')['Close'].iloc[-1])
+        except Exception as e:
+            print(f"[DAX Fetch Error] {e}")
+            features['dax'] = None
+        # FTSE 100 (UK): '^FTSE'
+        try:
+            features['ftse'] = float(yf.Ticker('^FTSE').history(period='1d')['Close'].iloc[-1])
+        except Exception as e:
+            print(f"[FTSE Fetch Error] {e}")
+            features['ftse'] = None
+        # Hang Seng (Hong Kong): '^HSI'
+        try:
+            features['hangseng'] = float(yf.Ticker('^HSI').history(period='1d')['Close'].iloc[-1])
+        except Exception as e:
+            print(f"[Hang Seng Fetch Error] {e}")
+            features['hangseng'] = None
+        return features
+    except Exception as e:
+        print(f"[Volatility/Global Fetch Error] {e}")
+        return {}
+
+# Add to macro aggregation
 def aggregate_macro_factors():
     """
-    Aggregate all macroeconomic and market factors into a single dictionary for analysis, in parallel.
+    Aggregate all macroeconomic and market factors into a single dictionary for analysis, in parallel, with per-source timeouts.
     Returns:
         dict: Aggregated macro/market data.
     """
@@ -601,10 +759,11 @@ def aggregate_macro_factors():
         'currency': fetch_currency_data,
         'government_policy': fetch_government_policy_data,
         'earnings_season': fetch_earnings_season_data,
+        'volatility_global': fetch_volatility_and_global_features,
     }
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
-        future_to_key = {executor.submit(fn): key for key, fn in fetchers.items()}
+        future_to_key = {executor.submit(run_with_timeout, fn, 10, None): key for key, fn in fetchers.items()}
         for future in concurrent.futures.as_completed(future_to_key):
             key = future_to_key[future]
             try:
