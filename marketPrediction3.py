@@ -1,0 +1,601 @@
+import yfinance as yf
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+import pandas as pd
+import numpy as np
+import plotly.graph_objs as go
+from dash import Dash, dcc, html
+from dash.dependencies import Input, Output
+from textblob import TextBlob
+from sklearn.preprocessing import MinMaxScaler
+from keras.models import Sequential
+from keras.layers import LSTM, Dense, Dropout
+import requests
+from bs4 import BeautifulSoup
+from transformers import BertTokenizer, BertForSequenceClassification
+from transformers import pipeline
+import smtplib
+import datetime as dt
+import threading
+import time
+import csv
+from keys import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,FRED_API_KEY
+import pytz
+from datetime import datetime, time as dtime
+from fredapi import Fred
+import functools
+import logging
+
+# Add your Telegram bot token and chat ID here
+TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN 
+TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID
+FRED_API_KEY = FRED_API_KEY
+# ---------------- CONFIG -------------------
+
+# --------------- GLOBAL STORE --------------
+data_store = {
+    "actual": [],
+    "predicted": [],
+    "timestamps": [],
+    "sentiment_score": []
+}
+
+tokenizer = BertTokenizer.from_pretrained('yiyanghkust/finbert-tone')
+model = BertForSequenceClassification.from_pretrained('yiyanghkust/finbert-tone')
+classifier = pipeline("sentiment-analysis", model=model, tokenizer=tokenizer)
+
+# FRED API setup
+# You can get a free FRED API key at https://fred.stlouisfed.org/docs/api/api_key.html
+# For public data, some endpoints work without a key, but you can add your key here for reliability.
+fred = Fred(api_key=FRED_API_KEY)
+
+# --------------- DATA FUNCTIONS ------------
+def get_sp500_data(interval='5m', period='7d'):
+    """
+    Fetch historical S&P 500 data using yfinance.
+    Args:
+        interval (str): Data interval (e.g., '1d', '5m').
+        period (str): Data period (e.g., '1y', '5y').
+    Returns:
+        pd.DataFrame: Historical data for S&P 500.
+    """
+    sp500 = yf.Ticker("^GSPC")
+    hist = sp500.history(interval=interval, period=period)
+    return hist
+
+def get_sp500_data_for_lstm():
+    """
+    Get 6 months of daily S&P 500 data for LSTM model training.
+    Returns:
+        pd.DataFrame: Historical daily data for 6 months.
+    """
+    return get_sp500_data(interval='1m', period='7d')
+
+def get_sp500_data_for_live():
+    """
+    Get recent S&P 500 data for live prediction (1-minute interval, 7 days).
+    Returns:
+        pd.DataFrame: Recent minute-level data.
+    """
+    return get_sp500_data(interval='1m', period='7d')
+
+# --------------- SENTIMENT (LLM) ------------
+
+def fetch_sentiment_finbert():
+    ...
+    headlines = []
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    news_sources = [
+        {"url": "https://www.marketwatch.com/latest-news", "tag": "h3"},
+        {"url": "https://www.reuters.com/markets/", "tag": "h3"},
+        {"url": "https://www.cnbc.com/world/?region=world", "tag": "a"},
+        {"url": "https://www.bloomberg.com/markets", "tag": "h1"},
+        {"url": "https://www.ft.com/markets", "tag": "a"},]
+    
+    for source in news_sources:
+        try:
+            r = requests.get(source["url"], headers=headers, timeout=10)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            tags = soup.find_all(source["tag"], limit=5)
+            headlines += [tag.get_text(strip=True) for tag in tags if tag.get_text(strip=True)]
+        except Exception as e:
+            print(f"Error fetching {source['url']}: {e}")
+            continue  # skip to next source
+
+    if not headlines:
+        print("No headlines found. Returning neutral sentiment (0).")
+        return 0.0
+
+    try:
+        results = classifier(headlines)
+        score_map = {'Positive': 1, 'Neutral': 0, 'Negative': -1}
+        scores = [score_map[r['label']] for r in results]
+        return np.mean(scores)
+    except Exception as e:
+        print(f"Error during sentiment classification: {e}")
+        return 0.0
+
+# --------------- LSTM MODEL -----------------
+def train_lstm_model(hist):
+    """
+    Train an LSTM model on historical closing price data.
+    Args:
+        hist (pd.DataFrame): Historical price data with 'Close' column.
+    Returns:
+        model (Sequential): Trained Keras LSTM model.
+        scaler (MinMaxScaler): Scaler fitted to the data.
+    """
+    data = hist['Close'].values.reshape(-1, 1)
+    scaler = MinMaxScaler()
+    data_scaled = scaler.fit_transform(data)
+
+    X, y = [], []
+    for i in range(60, len(data_scaled)):
+        X.append(data_scaled[i-60:i])
+        y.append(data_scaled[i])
+
+    X, y = np.array(X), np.array(y)
+    X = X.reshape((X.shape[0], X.shape[1], 1))
+
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=(60,1)),
+        Dropout(0.2),
+        LSTM(50),
+        Dropout(0.2),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=30, batch_size=64, verbose=0)
+
+    return model, scaler
+
+def predict_lstm(model, scaler, hist):
+    """
+    Predict the next closing price using the trained LSTM model.
+    Args:
+        model (Sequential): Trained LSTM model.
+        scaler (MinMaxScaler): Fitted scaler.
+        hist (pd.DataFrame): Recent price data with 'Close' column.
+    Returns:
+        float: Predicted next closing price.
+    """
+    last_60 = hist['Close'].values[-60:].reshape(-1, 1)
+    last_scaled = scaler.transform(last_60)
+    X_test = np.expand_dims(last_scaled, axis=(0, -1))
+    pred_scaled = model.predict(X_test, verbose=0)
+    prediction = scaler.inverse_transform(pred_scaled)[0][0]
+    return prediction
+
+# --------------- EMAIL ALERT ---------------
+
+
+# ----------- UPDATE THREAD ------------------
+hist_daily = get_sp500_data_for_lstm()
+model_lstm, scaler_lstm = train_lstm_model(hist_daily)
+
+def save_data_to_csv():
+    """
+    Save the entire dashboard data to a CSV file, including all actual values.
+    """
+    file_exists = os.path.isfile('dashboard_data.csv')
+    with open('dashboard_data.csv', 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
+        for t, a, p, s in zip(data_store['timestamps'], data_store['actual'], data_store['predicted'], data_store['sentiment_score']):
+            writer.writerow([t, a, p, s])
+
+def load_data_from_csv():
+    """
+    Load dashboard data from a CSV file into the data_store.
+    """
+    try:
+        df = pd.read_csv('dashboard_data.csv', parse_dates=['timestamp'])
+        data_store['timestamps'] = list(df['timestamp'])
+        data_store['actual'] = list(df['actual'])
+        data_store['predicted'] = list(df['predicted'])
+        data_store['sentiment_score'] = list(df['sentiment_score'])
+    except Exception:
+        pass
+
+# Load data at startup
+load_data_from_csv()
+
+def send_telegram_message(message, bot_token, chat_id):
+    """
+    Send a message to a Telegram chat using a bot.
+    Args:
+        message (str): The message to send.
+        bot_token (str): Telegram bot token.
+        chat_id (str): Telegram chat ID.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
+
+def is_market_open():
+    eastern = pytz.timezone('US/Eastern')
+    now_et = datetime.now(eastern)
+    is_weekday = now_et.weekday() < 5
+    open_time = dtime(9, 30)
+    close_time = dtime(16, 0)
+    return is_weekday and open_time <= now_et.time() <= close_time
+
+def update_data():
+    global model_lstm, scaler_lstm
+    retrain_interval = 1440
+    cycle_count = 0
+    after_hours_sentiment = 0.0
+    after_hours_summary = ""
+    while True:
+        try:
+            cycle_start = time.perf_counter()
+            if is_market_open():
+                hist = get_sp500_data_for_live()
+                sentiment = fetch_sentiment_finbert()
+                sentiment += after_hours_sentiment
+                prediction_lstm = predict_lstm(model_lstm, scaler_lstm, hist)
+                sentiment_weight = (hist['Close'].iloc[-1] * 0.005)
+                prediction = prediction_lstm + sentiment * sentiment_weight
+
+                # --- Macro factors integration ---
+                macro_factors = aggregate_macro_factors()
+                macro_score = sum(1 for v in macro_factors.values() if v not in [None, 0, '', {}, []]) / len(macro_factors)
+                if 'macro_score' not in data_store:
+                    data_store['macro_score'] = []
+
+                actual = hist["Close"].iloc[-1]
+                now = dt.datetime.now()
+                next_timestamp = now + dt.timedelta(minutes=1)
+                data_store["timestamps"].append(next_timestamp)
+                data_store["predicted"].append(prediction)
+                data_store["actual"].append(None)
+                data_store["sentiment_score"].append(sentiment)
+                data_store["macro_score"].append(macro_score)
+                save_data_to_csv()
+
+                if len(data_store["actual"]) > 1 and data_store["actual"][-2] is None:
+                    data_store["actual"][-2] = actual
+                    save_data_to_csv()
+
+                if abs(sentiment) >= 0.6:
+                    direction = "POSITIVE" if sentiment > 0 else "NEGATIVE"
+                    message = f"Market sentiment is {direction} ({sentiment:.2f}) at {now.strftime('%Y-%m-%d %H:%M:%S')}! Consider short-term trading."
+                    send_telegram_message(message, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+
+                cycle_count += 1
+                if cycle_count % retrain_interval == 0:
+                    print("Retraining LSTM model with latest data...")
+                    hist_daily = get_sp500_data_for_lstm()
+                    model_lstm, scaler_lstm = train_lstm_model(hist_daily)
+                    print("Retraining complete.")
+            else:
+                run_after_hours_analysis()
+                time.sleep(300)
+                continue
+        except Exception as e:
+            print(f"[Update Thread Error] {e}")
+        cycle_elapsed = time.perf_counter() - cycle_start
+        logging.info(f"update_data cycle took {cycle_elapsed:.3f} seconds")
+        time.sleep(60)
+
+def run_after_hours_analysis():
+    """
+    Run after-hours S&P 500 analysis in a background thread.
+    Only run detailed research on weekends.
+    Updates the data_store with research results when done.
+    """
+    def analysis_task():
+        after_hours_summary, after_hours_sentiment = analyze_sp500_components()
+        # Only run detailed research on weekends
+        if datetime.now(pytz.timezone('US/Eastern')).weekday() >= 5:
+            detailed_summary, detailed_score = analyze_sp500_detailed_parallel()
+            after_hours_summary += "\n" + detailed_summary
+            after_hours_sentiment += detailed_score
+        print("[After Hours Research]", after_hours_summary)
+        # Optionally, update data_store or dashboard here
+        if "sentiment_summaries" in data_store:
+            data_store["sentiment_summaries"].append("After Hours Research:\n" + after_hours_summary)
+        save_data_to_csv()
+    t = threading.Thread(target=analysis_task, daemon=True)
+    t.start()
+
+# ---------------- DASH APP ------------------
+app = Dash(__name__)
+app.title = "S&P 500 Prediction Dashboard"
+
+app.layout = html.Div([
+    html.H1("Live S&P 500 Prediction Dashboard"),
+    dcc.Graph(id='trend-graph'),
+    dcc.Interval(id='interval', interval=60*1000, n_intervals=0)
+])
+
+@app.callback(
+    Output('trend-graph', 'figure'),
+    [Input('interval', 'n_intervals')]
+)
+def update_graph(n):
+    if len(data_store["timestamps"]) == 0:
+        return go.Figure()
+
+    window = 5
+    predicted_smoothed = pd.Series(data_store["predicted"]).rolling(window, min_periods=1).mean()
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["actual"],
+                             mode='lines+markers', name='Actual Price'))
+    fig.add_trace(go.Scatter(x=data_store["timestamps"], y=predicted_smoothed,
+                             mode='lines+markers', name='Predicted (Smoothed)'))
+    fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["sentiment_score"],
+                             mode='lines+markers', name='Sentiment Score', yaxis='y2'))
+    # Add macro score if present
+    if "macro_score" in data_store and len(data_store["macro_score"]) == len(data_store["timestamps"]):
+        fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["macro_score"],
+                                 mode='lines+markers', name='Macro Score', yaxis='y3'))
+
+    fig.update_layout(
+        title='S&P 500 Actual vs Predicted with Sentiment and Macro Factors',
+        xaxis_title='Timestamp',
+        yaxis_title='Price',
+        yaxis2=dict(title='Sentiment', overlaying='y', side='right', showgrid=False),
+        yaxis3=dict(title='Macro Score', overlaying='y', side='left', position=0.05, showgrid=False),
+        template='plotly_dark'
+    )
+    return fig
+
+# S&P 500 tickers (short demo list, expand as needed)
+SP500_TICKERS = [
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'V', 'UNH', 'HD', 'PG', 'MA', 'DIS', 'BAC', 'VZ', 'ADBE', 'CMCSA', 'NFLX', 'KO', 'PFE', 'T', 'CSCO', 'PEP', 'ABT', 'CRM', 'XOM', 'CVX', 'WMT', 'INTC', 'MCD', 'MDT', 'COST', 'DHR', 'NKE', 'LLY', 'TMO', 'NEE', 'TXN', 'LIN', 'UNP', 'HON', 'PM', 'ORCL', 'AMGN', 'QCOM', 'IBM', 'ACN', 'AVGO', 'LOW', 'SBUX', 'MMM', 'GE', 'CAT', 'GS', 'BLK', 'AXP', 'SPGI', 'PLD', 'ISRG', 'MDLZ', 'CB', 'AMT', 'SYK', 'GILD', 'ZTS', 'CI', 'DE', 'DUK', 'MMC', 'ADI', 'C', 'SO', 'USB', 'PNC', 'TGT', 'BDX', 'CL', 'SHW', 'ICE', 'APD', 'ITW', 'MO', 'BKNG', 'FIS', 'ADP', 'EW', 'VRTX', 'REGN', 'AON', 'ETN', 'ECL', 'NSC', 'FDX', 'EMR', 'PSA', 'AIG', 'HUM', 'PSX', 'D', 'AEP', 'ALL', 'AFL', 'A', 'BAX', 'BMY', 'COF', 'DOV', 'EOG', 'EXC', 'F', 'GM', 'HCA', 'KMB', 'LHX', 'LMT', 'MET', 'MS', 'MTB', 'NOC', 'PGR', 'PRU', 'RF', 'RMD', 'SRE', 'STT', 'TFC', 'TRV', 'VLO', 'WBA', 'WELL', 'WMB', 'WST', 'ZBH'
+]
+
+def analyze_sp500_components():
+    """
+    Fetch and analyze all S&P 500 components for after-hours research.
+    Returns a summary string for dashboard and a numeric score for next day sentiment.
+    """
+    try:
+        data = yf.download(SP500_TICKERS, period='1d', group_by='ticker', threads=True)
+        gainers = []
+        losers = []
+        for ticker in SP500_TICKERS:
+            try:
+                close = data[ticker]['Close'].iloc[-1]
+                open_ = data[ticker]['Open'].iloc[-1]
+                change = (close - open_) / open_ * 100
+                if change > 2:
+                    gainers.append(f"{ticker} (+{change:.2f}%)")
+                elif change < -2:
+                    losers.append(f"{ticker} ({change:.2f}%)")
+            except Exception:
+                continue
+        summary = f"Top Gainers: {', '.join(gainers[:5])}\nTop Losers: {', '.join(losers[:5])}"
+        score = (len(gainers) - len(losers)) / len(SP500_TICKERS)
+        return summary, score
+    except Exception as e:
+        return f"[SP500 Analysis Error] {e}", 0.0
+
+
+def analyze_sp500_detailed_parallel():
+    """
+    Perform detailed analysis (quarterly profit, moving average, volume) for S&P 500 components in parallel.
+    Returns a summary string and a numeric score for next day sentiment.
+    """
+    def analyze_ticker(ticker):
+        try:
+            data = yf.Ticker(ticker)
+            hist = data.history(period='6mo', interval='1d')
+            info = data.info
+            ma20 = hist['Close'].rolling(window=20).mean().iloc[-1]
+            avg_vol = hist['Volume'].rolling(window=20).mean().iloc[-1]
+            profit = info.get('profitMargins', None)
+            return {
+                'ticker': ticker,
+                'ma20': ma20,
+                'avg_vol': avg_vol,
+                'profit': profit
+            }
+        except Exception as e:
+            return {'ticker': ticker, 'error': str(e)}
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for res in executor.map(analyze_ticker, SP500_TICKERS):
+            results.append(res)
+
+    ma20_positive = [r for r in results if isinstance(r.get('ma20'), float) and r['ma20'] > 0]
+    avg_vol_high = [r for r in results if isinstance(r.get('avg_vol'), float) and r['avg_vol'] > 1e6]
+    profit_positive = [r for r in results if r.get('profit') and r['profit'] > 0]
+    summary = (
+        f"Tickers with positive 20-day MA: {len(ma20_positive)}\n"
+        f"Tickers with avg volume > 1M: {len(avg_vol_high)}\n"
+        f"Tickers with positive profit margin: {len(profit_positive)}\n"
+    )
+    score = (len(ma20_positive) + len(avg_vol_high) + len(profit_positive)) / (3 * len(SP500_TICKERS))
+    return summary, score
+
+# ----------------- MACROECONOMIC & MARKET FACTORS FETCHERS -----------------
+def fetch_gdp_data():
+    """
+    Fetch latest GDP data from a reliable source (e.g., FRED, World Bank API).
+    Returns:
+        float or dict: Latest GDP value or structured GDP data.
+    """
+    @profile_time
+    def inner():
+        try:
+            gdp = fred.get_series_latest_release('GDP')
+            return float(gdp) if gdp is not None else None
+        except Exception as e:
+            print(f"[GDP Fetch Error] {e}")
+            return None
+    return inner()
+
+def fetch_inflation_data():
+    """
+    Fetch latest inflation data (e.g., CPI) from a reliable source.
+    Returns:
+        float or dict: Latest inflation value or structured data.
+    """
+    @profile_time
+    def inner():
+        try:
+            cpi = fred.get_series_latest_release('CPIAUCSL')
+            return float(cpi) if cpi is not None else None
+        except Exception as e:
+            print(f"[Inflation Fetch Error] {e}")
+            return None
+    return inner()
+
+# Fed Policy (scrape Federal Reserve news headlines)
+def fetch_fed_policy_data():
+    try:
+        url = 'https://www.federalreserve.gov/newsevents/pressreleases.htm'
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        headlines = [h.get_text(strip=True) for h in soup.select('.item .title')][:5]
+        return {'headlines': headlines}
+    except Exception as e:
+        print(f"[Fed Policy Fetch Error] {e}")
+        return None
+
+# Global Events (reuse FinBERT/news logic for sentiment)
+def fetch_global_events_data():
+    try:
+        sentiment = fetch_sentiment_finbert()
+        return {'sentiment': sentiment}
+    except Exception as e:
+        print(f"[Global Events Fetch Error] {e}")
+        return None
+
+# Government Policy (scrape recent US government press releases)
+def fetch_government_policy_data():
+    try:
+        url = 'https://www.whitehouse.gov/briefing-room/statements-releases/'
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        releases = [a.get_text(strip=True) for a in soup.select('article h2 a')][:5]
+        return {'releases': releases}
+    except Exception as e:
+        print(f"[Gov Policy Fetch Error] {e}")
+        return None
+
+# Earnings Season (Yahoo Finance earnings calendar summary)
+def fetch_earnings_season_data():
+    try:
+        url = 'https://finance.yahoo.com/calendar/earnings/'
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        # Find summary stats (e.g., number of beats/misses)
+        summary = soup.find('section', {'data-test': 'earnings-summary'}).get_text(strip=True)
+        return {'summary': summary}
+    except Exception as e:
+        print(f"[Earnings Fetch Error] {e}")
+        return None
+
+def fetch_sector_performance_data():
+    try:
+        # Select Sector SPDR ETFs (XLF, XLK, XLE, etc.)
+        sector_etfs = ['XLF', 'XLK', 'XLE', 'XLV', 'XLY', 'XLI', 'XLC', 'XLRE', 'XLU', 'XLB', 'XLP']
+        sector_perf = {}
+        for etf in sector_etfs:
+            hist = yf.Ticker(etf).history(period='5d')
+            perf = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
+            sector_perf[etf] = perf
+        return sector_perf
+    except Exception as e:
+        print(f"[Sector Performance Fetch Error] {e}")
+        return None
+
+def fetch_bond_yields_data():
+    """
+    Fetch latest bond yields (e.g., US 10Y Treasury).
+    Returns:
+        float or dict: Bond yield value(s).
+    """
+    @profile_time
+    def inner():
+        try:
+            # Example: 10-Year Treasury Constant Maturity Rate
+            yield_10y = fred.get_series_latest_release('DGS10')
+            return float(yield_10y) if yield_10y is not None else None
+        except Exception as e:
+            print(f"[Bond Yield Fetch Error] {e}")
+            return None
+    return inner()
+
+def fetch_commodities_data():
+    try:
+        # Gold: 'GC=F', Oil: 'CL=F'
+        gold = yf.Ticker('GC=F').history(period='1d')['Close'].iloc[-1]
+        oil = yf.Ticker('CL=F').history(period='1d')['Close'].iloc[-1]
+        return {'gold': float(gold), 'oil': float(oil)}
+    except Exception as e:
+        print(f"[Commodities Fetch Error] {e}")
+        return None
+
+def fetch_currency_data():
+    try:
+        # US Dollar Index: 'DX-Y.NYB' or 'DXY'
+        dxy = yf.Ticker('DX-Y.NYB').history(period='1d')['Close'].iloc[-1]
+        return {'usd_index': float(dxy)}
+    except Exception as e:
+        print(f"[Currency Fetch Error] {e}")
+        return None
+
+# ----------------- AGGREGATION FUNCTION -----------------
+def aggregate_macro_factors():
+    """
+    Aggregate all macroeconomic and market factors into a single dictionary for analysis.
+    Returns:
+        dict: Aggregated macro/market data.
+    """
+    start = time.perf_counter()
+    result = {
+        'gdp': fetch_gdp_data(),
+        'inflation': fetch_inflation_data(),
+        'fed_policy': fetch_fed_policy_data(),
+        'global_events': fetch_global_events_data(),
+        'sector_performance': fetch_sector_performance_data(),
+        'bond_yields': fetch_bond_yields_data(),
+        'commodities': fetch_commodities_data(),
+        'currency': fetch_currency_data(),
+        'government_policy': fetch_government_policy_data(),
+        'earnings_season': fetch_earnings_season_data(),
+    }
+    elapsed = time.perf_counter() - start
+    logging.info(f"aggregate_macro_factors took {elapsed:.3f} seconds")
+    return result
+
+# Setup logging for profiling
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
+
+def profile_time(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        logging.info(f"{func.__name__} took {elapsed:.3f} seconds")
+        return result
+    return wrapper
+
+# Decorate the rest of the fetchers
+fetch_fed_policy_data = profile_time(fetch_fed_policy_data)
+fetch_global_events_data = profile_time(fetch_global_events_data)
+fetch_government_policy_data = profile_time(fetch_government_policy_data)
+fetch_earnings_season_data = profile_time(fetch_earnings_season_data)
+fetch_sector_performance_data = profile_time(fetch_sector_performance_data)
+fetch_commodities_data = profile_time(fetch_commodities_data)
+fetch_currency_data = profile_time(fetch_currency_data)
+
+# ----------------- RUN ----------------------
+if __name__ == "__main__":
+    threading.Thread(target=update_data, daemon=True).start()
+    run_after_hours_analysis()  # Start the after-hours analysis thread
+    app.run(debug=True, port=8050)
