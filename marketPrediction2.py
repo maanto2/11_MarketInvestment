@@ -21,6 +21,7 @@ import time
 import csv
 import pytz
 from datetime import datetime, time as dtime
+import concurrent.futures
 from keys import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # Add your Telegram bot token and chat ID here
@@ -178,37 +179,27 @@ model_lstm, scaler_lstm = train_lstm_model(hist_daily)
 
 def save_data_to_csv():
     """
-    Append the latest data point to CSV.
+    Save the entire dashboard data to a CSV file, including all actual values.
     """
     file_exists = os.path.isfile('dashboard_data.csv')
-    with open('dashboard_data.csv', 'a', newline='') as csvfile:
+    with open('dashboard_data.csv', 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        if not file_exists:
-            writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
-        if data_store['timestamps']:
-            writer.writerow([
-                data_store['timestamps'][-1],
-                data_store['actual'][-1],
-                data_store['predicted'][-1],
-                data_store['sentiment_score'][-1]
-            ])
+        writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
+        for t, a, p, s in zip(data_store['timestamps'], data_store['actual'], data_store['predicted'], data_store['sentiment_score']):
+            writer.writerow([t, a, p, s])
 
 def load_data_from_csv():
     """
     Load dashboard data from a CSV file into the data_store.
     """
     try:
-        df = pd.read_csv('dashboard_data.csv')  # assumes header row exists
-        if df['timestamp'].iloc[0] == 'timestamp':
-            df = df.iloc[1:]  # skip header row if duplicated as data
-        df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S.%f', errors='coerce')
+        df = pd.read_csv('dashboard_data.csv', parse_dates=['timestamp'])
         data_store['timestamps'] = list(df['timestamp'])
         data_store['actual'] = list(df['actual'])
         data_store['predicted'] = list(df['predicted'])
         data_store['sentiment_score'] = list(df['sentiment_score'])
-    except Exception as e:
-        print(f"[CSV Load Error] {e}")
-
+    except Exception:
+        pass
 # Load data at startup
 load_data_from_csv()
 
@@ -288,6 +279,95 @@ def update_data():
         print(f"[Cycle Runtime] {elapsed:.2f} seconds")
         time.sleep(max(0, 60 - elapsed))
 
+def run_after_hours_analysis():
+    """
+    Run after-hours S&P 500 analysis in a background thread.
+    Updates the data_store with research results when done.
+    """
+    def analysis_task():
+        after_hours_summary, after_hours_sentiment = analyze_sp500_components()
+        detailed_summary, detailed_score = analyze_sp500_detailed_parallel()
+        combined_summary = after_hours_summary + "\n" + detailed_summary
+        combined_score = after_hours_sentiment + detailed_score
+        print("[After Hours Research]", combined_summary)
+        # Optionally, update data_store or dashboard here
+        data_store["sentiment_summaries"].append("After Hours Research:\n" + combined_summary)
+        save_data_to_csv()
+    t = threading.Thread(target=analysis_task, daemon=True)
+    t.start()
+
+# S&P 500 tickers (short demo list, expand as needed)
+SP500_TICKERS = [
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'V', 'UNH', 'HD', 'PG', 'MA', 'DIS', 'BAC', 'VZ', 'ADBE', 'CMCSA', 'NFLX', 'KO', 'PFE', 'T', 'CSCO', 'PEP', 'ABT', 'CRM', 'XOM', 'CVX', 'WMT', 'INTC', 'MCD', 'MDT', 'COST', 'DHR', 'NKE', 'LLY', 'TMO', 'NEE', 'TXN', 'LIN', 'UNP', 'HON', 'PM', 'ORCL', 'AMGN', 'QCOM', 'IBM', 'ACN', 'AVGO', 'LOW', 'SBUX', 'MMM', 'GE', 'CAT', 'GS', 'BLK', 'AXP', 'SPGI', 'PLD', 'ISRG', 'MDLZ', 'CB', 'AMT', 'SYK', 'GILD', 'ZTS', 'CI', 'DE', 'DUK', 'MMC', 'ADI', 'C', 'SO', 'USB', 'PNC', 'TGT', 'BDX', 'CL', 'SHW', 'ICE', 'APD', 'ITW', 'MO', 'BKNG', 'FIS', 'ADP', 'EW', 'VRTX', 'REGN', 'AON', 'ETN', 'ECL', 'NSC', 'FDX', 'EMR', 'PSA', 'AIG', 'HUM', 'PSX', 'D', 'AEP', 'ALL', 'AFL', 'A', 'BAX', 'BMY', 'COF', 'DOV', 'EOG', 'EXC', 'F', 'GM', 'HCA', 'KMB', 'LHX', 'LMT', 'MET', 'MS', 'MTB', 'NOC', 'PGR', 'PRU', 'RF', 'RMD', 'SRE', 'STT', 'TFC', 'TRV', 'VLO', 'WBA', 'WELL', 'WMB', 'WST', 'ZBH'
+]
+
+# S&P 500 market hours (Eastern Time)
+def is_market_open():
+    eastern = pytz.timezone('US/Eastern')
+    now_et = datetime.now(eastern)
+    is_weekday = now_et.weekday() < 5
+    open_time = dtime(9, 30)
+    close_time = dtime(16, 0)
+    return is_weekday and open_time <= now_et.time() <= close_time
+
+def analyze_sp500_components():
+    """
+    Fetch and analyze all S&P 500 components for after-hours research.
+    Returns a summary string for dashboard and a numeric score for next day sentiment.
+    """
+    try:
+        data = yf.download(SP500_TICKERS, period='1d', group_by='ticker', threads=True)
+        gainers = []
+        losers = []
+        for ticker in SP500_TICKERS:
+            try:
+                close = data[ticker]['Close'].iloc[-1]
+                open_ = data[ticker]['Open'].iloc[-1]
+                change = (close - open_) / open_ * 100
+                if change > 2:
+                    gainers.append(f"{ticker} (+{change:.2f}%)")
+                elif change < -2:
+                    losers.append(f"{ticker} ({change:.2f}%)")
+            except Exception:
+                continue
+        summary = f"Top Gainers: {', '.join(gainers[:5])}\nTop Losers: {', '.join(losers[:5])}"
+        # Simple sentiment: more gainers = positive, more losers = negative
+        score = (len(gainers) - len(losers)) / len(SP500_TICKERS)
+        return summary, score
+    except Exception as e:
+        return f"[SP500 Analysis Error] {e}", 0.0
+
+def analyze_sp500_detailed_parallel():
+    def analyze_ticker(ticker):
+        try:
+            data = yf.Ticker(ticker)
+            hist = data.history(period='6mo', interval='1d')
+            info = data.info
+            ma20 = hist['Close'].rolling(window=20).mean().iloc[-1]
+            avg_vol = hist['Volume'].rolling(window=20).mean().iloc[-1]
+            profit = info.get('profitMargins', None)
+            return {
+                'ticker': ticker,
+                'ma20': ma20,
+                'avg_vol': avg_vol,
+                'profit': profit
+            }
+        except Exception as e:
+            return {'ticker': ticker, 'error': str(e)}
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for res in executor.map(analyze_ticker, SP500_TICKERS):
+            results.append(res)
+    ma20_positive = [r for r in results if isinstance(r.get('ma20'), float) and r['ma20'] > 0]
+    avg_vol_high = [r for r in results if isinstance(r.get('avg_vol'), float) and r['avg_vol'] > 1e6]
+    profit_positive = [r for r in results if r.get('profit') and r['profit'] > 0]
+    summary = (
+        f"Tickers with positive 20-day MA: {len(ma20_positive)}\n"
+        f"Tickers with avg volume > 1M: {len(avg_vol_high)}\n"
+        f"Tickers with positive profit margin: {len(profit_positive)}\n"
+    )
+    score = (len(ma20_positive) + len(avg_vol_high) + len(profit_positive)) / (3 * len(SP500_TICKERS))
+    return summary, score
 # ---------------- DASH APP ------------------
 app = Dash(__name__)
 app.title = "S&P 500 Prediction Dashboard"
@@ -335,12 +415,6 @@ def is_market_open():
     close_time = dtime(16, 0)
     return is_weekday and open_time <= now_et.time() <= close_time
 
-# Get S&P 500 tickers (static list for demo, can be fetched from Wikipedia or yfinance)
-SP500_TICKERS = [
-    # ... (add a subset for demo, or fetch dynamically for full list)
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'BRK-B', 'NVDA', 'JPM', 'V', 'UNH', 'HD', 'PG', 'MA', 'DIS', 'BAC', 'VZ', 'ADBE', 'CMCSA', 'NFLX', 'KO', 'PFE', 'T', 'CSCO', 'PEP', 'ABT', 'CRM', 'XOM', 'CVX', 'WMT', 'INTC', 'MCD', 'MDT', 'COST', 'DHR', 'NKE', 'LLY', 'TMO', 'NEE', 'TXN', 'LIN', 'UNP', 'HON', 'PM', 'ORCL', 'AMGN', 'QCOM', 'IBM', 'ACN', 'AVGO', 'LOW', 'SBUX', 'MMM', 'GE', 'CAT', 'GS', 'BLK', 'AXP', 'SPGI', 'PLD', 'ISRG', 'MDLZ', 'CB', 'AMT', 'SYK', 'GILD', 'ZTS', 'CI', 'DE', 'DUK', 'MMC', 'ADI', 'C', 'SO', 'USB', 'PNC', 'TGT', 'BDX', 'CL', 'SHW', 'ICE', 'APD', 'ITW', 'MO', 'BKNG', 'FIS', 'ADP', 'EW', 'VRTX', 'REGN', 'AON', 'ETN', 'ECL', 'NSC', 'FDX', 'EMR', 'PSA', 'AIG', 'HUM', 'PSX', 'D', 'AEP', 'ALL', 'AFL', 'A', 'BAX', 'BMY', 'COF', 'DOV', 'EOG', 'EXC', 'F', 'GM', 'HCA', 'KMB', 'LHX', 'LMT', 'MET', 'MS', 'MTB', 'NOC', 'PGR', 'PRU', 'RF', 'RMD', 'SRE', 'STT', 'TFC', 'TRV', 'VLO', 'WBA', 'WELL', 'WMB', 'WST', 'ZBH'
-]
-
 def analyze_sp500_components():
     """
     Fetch and analyze all S&P 500 components for after-hours research.
@@ -350,7 +424,6 @@ def analyze_sp500_components():
         data = yf.download(SP500_TICKERS, period='1d', group_by='ticker', threads=True)
         gainers = []
         losers = []
-        sector_perf = {}
         for ticker in SP500_TICKERS:
             try:
                 close = data[ticker]['Close'].iloc[-1]
@@ -371,3 +444,7 @@ def analyze_sp500_components():
 
 
 
+# ----------------- RUN ----------------------
+if __name__ == "__main__":
+    threading.Thread(target=update_data, daemon=True).start()
+    app.run(debug=True, port=8050)
