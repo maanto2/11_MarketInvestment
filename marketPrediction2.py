@@ -185,9 +185,13 @@ def save_data_to_csv():
         writer = csv.writer(csvfile)
         if not file_exists:
             writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
-        # Write all rows, not just the last one
-        for t, a, p, s in zip(data_store['timestamps'], data_store['actual'], data_store['predicted'], data_store['sentiment_score']):
-            writer.writerow([t, a, p, s])
+        if data_store['timestamps']:
+            writer.writerow([
+                data_store['timestamps'][-1],
+                data_store['actual'][-1],
+                data_store['predicted'][-1],
+                data_store['sentiment_score'][-1]
+            ])
 
 def load_data_from_csv():
     """
