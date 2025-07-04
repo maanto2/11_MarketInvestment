@@ -21,7 +21,7 @@ import time
 import csv
 from keys import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,FRED_API_KEY
 import pytz
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone
 from fredapi import Fred
 import functools
 import logging
@@ -85,7 +85,6 @@ def get_sp500_data_for_live():
 def fetch_sentiment_finbert():
     headlines = []
     headers = {'User-Agent': 'Mozilla/5.0'}
-    
     news_sources = [
         # US/global
         {"url": "https://www.marketwatch.com/latest-news", "tag": "h3"},
@@ -110,7 +109,7 @@ def fetch_sentiment_finbert():
         try:
             r = requests.get(source["url"], headers=headers, timeout=10)
             soup = BeautifulSoup(r.text, 'html.parser')
-            tags = soup.find_all(source["tag"], limit=5)
+            tags = soup.find_all(source["tag"], limit=2)  # limit to 2 headlines per source
             headlines += [tag.get_text(strip=True) for tag in tags if tag.get_text(strip=True)]
         except Exception as e:
             print(f"Error fetching {source['url']}: {e}")
@@ -130,7 +129,7 @@ def fetch_sentiment_finbert():
         return 0.0
 
 # Caching decorator for slow/rarely-changing sources
-def cache_result(ttl_seconds=600):
+def cache_result(ttl_seconds=1800):
     def decorator(func):
         cache = {}
         def wrapper(*args, **kwargs):
@@ -212,7 +211,7 @@ def fetch_sentiment_china_news():
         try:
             r = requests.get(source["url"], headers=headers, timeout=10)
             soup = BeautifulSoup(r.text, 'html.parser')
-            tags = soup.find_all(source["tag"], limit=5)
+            tags = soup.find_all(source["tag"], limit=2)  # limit to 2 headlines per source
             headlines += [tag.get_text(strip=True) for tag in tags if tag.get_text(strip=True)]
         except Exception as e:
             print(f"Error fetching {source['url']}: {e}")
@@ -298,14 +297,18 @@ model_lstm, scaler_lstm = train_lstm_model(hist_daily)
 
 def save_data_to_csv():
     """
-    Save the entire dashboard data to a CSV file, including all actual values.
+    Save the entire dashboard data to a CSV file, including all actual values, rounding decimals to 2 digits.
     """
     file_exists = os.path.isfile('dashboard_data.csv')
     with open('dashboard_data.csv', 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['timestamp', 'actual', 'predicted', 'sentiment_score'])
         for t, a, p, s in zip(data_store['timestamps'], data_store['actual'], data_store['predicted'], data_store['sentiment_score']):
-            writer.writerow([t, a, p, s])
+            # Round floats to 2 decimal places if not None, else write as is
+            a_ = round(a, 2) if isinstance(a, float) and a is not None else a
+            p_ = round(p, 2) if isinstance(p, float) and p is not None else p
+            s_ = round(s, 2) if isinstance(s, float) and s is not None else s
+            writer.writerow([t, a_, p_, s_])
 
 def load_data_from_csv():
     """
@@ -339,12 +342,47 @@ def send_telegram_message(message, bot_token, chat_id):
         print(f"Error sending Telegram message: {e}")
 
 def is_market_open():
-    eastern = pytz.timezone('US/Eastern')
-    now_et = datetime.now(eastern)
-    is_weekday = now_et.weekday() < 5
+    us_now = get_us_eastern_time_online()
+    is_weekday = us_now.weekday() < 5
     open_time = dtime(9, 30)
     close_time = dtime(16, 0)
-    return is_weekday and open_time <= now_et.time() <= close_time
+    return is_weekday and open_time <= us_now.time() <= close_time
+
+def get_us_eastern_time_online():
+    try:
+        r = requests.get('http://worldtimeapi.org/api/timezone/America/New_York', timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            dt_str = data['datetime']
+            # Example: '2025-07-04T10:15:30.123456-04:00'
+            from dateutil import parser
+            return parser.isoparse(dt_str)
+    except Exception as e:
+        print(f"[Time API Error] {e}")
+    # Fallback to local system time if API fails
+    eastern = pytz.timezone('US/Eastern')
+    return datetime.now(eastern)
+
+def get_local_and_us_time():
+    """
+    Returns current local system time and US/Eastern time as datetime objects.
+    """
+    local_now = datetime.now().astimezone()
+    eastern = pytz.timezone('US/Eastern')
+    us_now = datetime.now(eastern)
+    return local_now, us_now
+
+# Update is_market_open to also return local and US/Eastern time for dashboard
+
+def is_market_open_with_times():
+    eastern = pytz.timezone('US/Eastern')
+    us_now = datetime.now(eastern)
+    is_weekday = us_now.weekday() < 5
+    open_time = dtime(9, 30)
+    close_time = dtime(16, 0)
+    market_open = is_weekday and open_time <= us_now.time() <= close_time
+    local_now = datetime.now().astimezone()
+    return market_open, local_now, us_now
 
 def update_data():
     global model_lstm, scaler_lstm
@@ -418,9 +456,10 @@ def run_after_hours_analysis():
             after_hours_summary += "\n" + detailed_summary
             after_hours_sentiment += detailed_score
         print("[After Hours Research]", after_hours_summary)
-        # Optionally, update data_store or dashboard here
-        if "sentiment_summaries" in data_store:
-            data_store["sentiment_summaries"].append("After Hours Research:\n" + after_hours_summary)
+        # Always append to sentiment_summaries
+        if "sentiment_summaries" not in data_store:
+            data_store["sentiment_summaries"] = []
+        data_store["sentiment_summaries"].append("After Hours Research:\n" + after_hours_summary)
         save_data_to_csv()
     t = threading.Thread(target=analysis_task, daemon=True)
     t.start()
@@ -433,18 +472,23 @@ app.layout = html.Div([
     html.H1("Live S&P 500 Prediction Dashboard"),
     html.Div(id='market-status-banner', style={'backgroundColor': '#222', 'color': 'yellow', 'padding': '8px', 'fontWeight': 'bold', 'fontSize': '18px', 'overflowX': 'auto', 'whiteSpace': 'nowrap'}),
     dcc.Graph(id='trend-graph'),
+    html.Div(id='news-summary', style={'backgroundColor': '#111', 'color': 'white', 'padding': '12px', 'marginTop': '10px', 'maxHeight': '200px', 'overflowY': 'auto', 'fontSize': '15px', 'border': '1px solid #333'}),
     dcc.Interval(id='interval', interval=60*1000, n_intervals=0)
 ])
 
+# Update the dashboard banner to show both times and market status
 @app.callback(
     Output('market-status-banner', 'children'),
     [Input('interval', 'n_intervals')]
 )
 def update_market_status(n):
-    if is_market_open():
-        return '🟢 Market is OPEN'
+    market_open, local_now, us_now = is_market_open_with_times()
+    local_str = local_now.strftime('%Y-%m-%d %H:%M:%S %Z')
+    us_str = us_now.strftime('%Y-%m-%d %H:%M:%S %Z')
+    if market_open:
+        return f'🟢 Market is OPEN | Local time: {local_str} | US/Eastern: {us_str}'
     else:
-        return '🔴 Market is CLOSED'
+        return f'🔴 Market is CLOSED | Local time: {local_str} | US/Eastern: {us_str}'
 
 @app.callback(
     Output('trend-graph', 'figure'),
@@ -462,26 +506,27 @@ def update_graph(n):
                              mode='lines+markers', name='Actual Price'))
     fig.add_trace(go.Scatter(x=data_store["timestamps"], y=predicted_smoothed,
                              mode='lines+markers', name='Predicted (Smoothed)'))
-    fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["sentiment_score"],
-                             mode='lines+markers', name='Sentiment Score', yaxis='y2'))
+    # Remove sentiment score from the graph
     # Add macro score if present
     if "macro_score" in data_store and len(data_store["macro_score"]) == len(data_store["timestamps"]):
         fig.add_trace(go.Scatter(x=data_store["timestamps"], y=data_store["macro_score"],
-                                 mode='lines+markers', name='Macro Score', yaxis='y3'))
+                                 mode='lines+markers', name='Macro Score', yaxis='y2'))
 
     fig.update_layout(
-        title='S&P 500 Actual vs Predicted with Sentiment and Macro Factors',
+        title='S&P 500 Actual vs Predicted with Macro Factors',
         xaxis_title='Timestamp',
         yaxis_title='Price',
-        yaxis2=dict(title='Sentiment', overlaying='y', side='right', showgrid=False),
-        yaxis3=dict(title='Macro Score', overlaying='y', side='left', position=0.05, showgrid=False),
+        yaxis2=dict(title='Macro Score', overlaying='y', side='right', showgrid=False),
         template='plotly_dark'
     )
     return fig
 
 # S&P 500 tickers (short demo list, expand as needed)
+# Reduce the number of tickers for after-hours analysis to the top 30 by market cap (example subset)
 SP500_TICKERS = [
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'V', 'UNH', 'HD', 'PG', 'MA', 'DIS', 'BAC', 'VZ', 'ADBE', 'CMCSA', 'NFLX', 'KO', 'PFE', 'T', 'CSCO', 'PEP', 'ABT', 'CRM', 'XOM', 'CVX', 'WMT', 'INTC', 'MCD', 'MDT', 'COST', 'DHR', 'NKE', 'LLY', 'TMO', 'NEE', 'TXN', 'LIN', 'UNP', 'HON', 'PM', 'ORCL', 'AMGN', 'QCOM', 'IBM', 'ACN', 'AVGO', 'LOW', 'SBUX', 'MMM', 'GE', 'CAT', 'GS', 'BLK', 'AXP', 'SPGI', 'PLD', 'ISRG', 'MDLZ', 'CB', 'AMT', 'SYK', 'GILD', 'ZTS', 'CI', 'DE', 'DUK', 'MMC', 'ADI', 'C', 'SO', 'USB', 'PNC', 'TGT', 'BDX', 'CL', 'SHW', 'ICE', 'APD', 'ITW', 'MO', 'BKNG', 'FIS', 'ADP', 'EW', 'VRTX', 'REGN', 'AON', 'ETN', 'ECL', 'NSC', 'FDX', 'EMR', 'PSA', 'AIG', 'HUM', 'PSX', 'D', 'AEP', 'ALL', 'AFL', 'A', 'BAX', 'BMY', 'COF', 'DOV', 'EOG', 'EXC', 'F', 'GM', 'HCA', 'KMB', 'LHX', 'LMT', 'MET', 'MS', 'MTB', 'NOC', 'PGR', 'PRU', 'RF', 'RMD', 'SRE', 'STT', 'TFC', 'TRV', 'VLO', 'WBA', 'WELL', 'WMB', 'WST', 'ZBH'
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'V', 'UNH',
+    'HD', 'PG', 'MA', 'DIS', 'BAC', 'VZ', 'ADBE', 'CMCSA', 'NFLX', 'KO',
+    'PFE', 'T', 'CSCO', 'PEP', 'ABT', 'CRM', 'XOM', 'CVX', 'WMT', 'INTC'
 ]
 
 def analyze_sp500_components():
@@ -773,6 +818,19 @@ def aggregate_macro_factors():
                 print(f"[aggregate_macro_factors] Error fetching {key}: {e}")
     return results
 
+def run_with_timeout(func, timeout=10, default=None):
+    """
+    Run a function with a timeout. If it takes too long, return default.
+    """
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func)
+        try:
+            return future.result(timeout=timeout)
+        except Exception as e:
+            print(f"[Timeout] {func.__name__} exceeded {timeout}s: {e}")
+            return default
+
 # Setup logging for profiling
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
 
@@ -786,14 +844,13 @@ def profile_time(func):
         return result
     return wrapper
 
-# Decorate the rest of the fetchers
-fetch_fed_policy_data = profile_time(fetch_fed_policy_data)
-fetch_global_events_data = profile_time(fetch_global_events_data)
-fetch_government_policy_data = profile_time(fetch_government_policy_data)
-fetch_earnings_season_data = profile_time(fetch_earnings_season_data)
-fetch_sector_performance_data = profile_time(fetch_sector_performance_data)
-fetch_commodities_data = profile_time(fetch_commodities_data)
-fetch_currency_data = profile_time(fetch_currency_data)
+# ----------- CACHE SLOW FETCHERS -----------
+# Place these at the very end of the file, after all function definitions
+fetch_government_policy_data = cache_result(1800)(fetch_government_policy_data)
+fetch_earnings_season_data = cache_result(1800)(fetch_earnings_season_data)
+fetch_sector_performance_data = cache_result(1800)(fetch_sector_performance_data)
+fetch_commodities_data = cache_result(1800)(fetch_commodities_data)
+fetch_currency_data = cache_result(1800)(fetch_currency_data)
 
 # ----------------- RUN ----------------------
 if __name__ == "__main__":
