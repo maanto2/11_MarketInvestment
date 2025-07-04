@@ -344,6 +344,8 @@ def send_telegram_message(message, bot_token, chat_id):
 def is_market_open():
     us_now = get_us_eastern_time_online()
     is_weekday = us_now.weekday() < 5
+    if is_us_market_holiday(us_now.date()):
+        return False
     open_time = dtime(9, 30)
     close_time = dtime(16, 0)
     return is_weekday and open_time <= us_now.time() <= close_time
@@ -378,9 +380,12 @@ def is_market_open_with_times():
     eastern = pytz.timezone('US/Eastern')
     us_now = datetime.now(eastern)
     is_weekday = us_now.weekday() < 5
-    open_time = dtime(9, 30)
-    close_time = dtime(16, 0)
-    market_open = is_weekday and open_time <= us_now.time() <= close_time
+    if is_us_market_holiday(us_now.date()):
+        market_open = False
+    else:
+        open_time = dtime(9, 30)
+        close_time = dtime(16, 0)
+        market_open = is_weekday and open_time <= us_now.time() <= close_time
     local_now = datetime.now().astimezone()
     return market_open, local_now, us_now
 
@@ -713,8 +718,12 @@ def fetch_bond_yields_data():
     """
     try:
         # Example: 10-Year Treasury Constant Maturity Rate
-        yield_10y = fred.get_series_latest_release('DGS10')
-        return float(yield_10y) if yield_10y is not None else None
+        series = fred.get_series_latest_release('DGS10')
+        if series is not None and hasattr(series, 'iloc') and len(series) > 0:
+            latest_value = series.iloc[-1]
+            return float(latest_value) if latest_value is not None else None
+        else:
+            return None
     except Exception as e:
         print(f"[Bond Yield Fetch Error] {e}")
         return None
@@ -851,6 +860,76 @@ fetch_earnings_season_data = cache_result(1800)(fetch_earnings_season_data)
 fetch_sector_performance_data = cache_result(1800)(fetch_sector_performance_data)
 fetch_commodities_data = cache_result(1800)(fetch_commodities_data)
 fetch_currency_data = cache_result(1800)(fetch_currency_data)
+
+# US public holidays when markets are closed (NYSE/NASDAQ)
+US_MARKET_HOLIDAYS = [
+    # New Year's Day
+    (1, 1),
+    # Martin Luther King Jr. Day (3rd Monday in January)
+    # Presidents' Day (3rd Monday in February)
+    # Good Friday (date varies, handled below)
+    # Memorial Day (last Monday in May)
+    # Juneteenth National Independence Day (June 19)
+    (6, 19),
+    # Independence Day
+    (7, 4),
+    # Labor Day (1st Monday in September)
+    # Thanksgiving Day (4th Thursday in November)
+    # Christmas Day
+    (12, 25),
+]
+import calendar
+
+def is_us_market_holiday(dt):
+    # Fixed-date holidays
+    if (dt.month, dt.day) in US_MARKET_HOLIDAYS:
+        return True
+    # MLK Day: 3rd Monday in January
+    if dt.month == 1 and dt.weekday() == 0 and 15 <= dt.day <= 21:
+        return True
+    # Presidents' Day: 3rd Monday in February
+    if dt.month == 2 and dt.weekday() == 0 and 15 <= dt.day <= 21:
+        return True
+    # Memorial Day: last Monday in May
+    if dt.month == 5 and dt.weekday() == 0 and dt.day + 7 > 31:
+        return True
+    # Labor Day: 1st Monday in September
+    if dt.month == 9 and dt.weekday() == 0 and 1 <= dt.day <= 7:
+        return True
+    # Thanksgiving: 4th Thursday in November
+    if dt.month == 11 and dt.weekday() == 3 and 22 <= dt.day <= 28:
+        return True
+    # Good Friday: calculate using easter
+    try:
+        import holidays
+        us_holidays = holidays.US(years=dt.year)
+        if dt in us_holidays and 'Good Friday' in us_holidays.get(dt, ''):
+            return True
+    except ImportError:
+        pass  # If holidays package not installed, skip Good Friday
+    return False
+
+def is_market_open():
+    us_now = get_us_eastern_time_online()
+    is_weekday = us_now.weekday() < 5
+    if is_us_market_holiday(us_now.date()):
+        return False
+    open_time = dtime(9, 30)
+    close_time = dtime(16, 0)
+    return is_weekday and open_time <= us_now.time() <= close_time
+
+def is_market_open_with_times():
+    eastern = pytz.timezone('US/Eastern')
+    us_now = datetime.now(eastern)
+    is_weekday = us_now.weekday() < 5
+    if is_us_market_holiday(us_now.date()):
+        market_open = False
+    else:
+        open_time = dtime(9, 30)
+        close_time = dtime(16, 0)
+        market_open = is_weekday and open_time <= us_now.time() <= close_time
+    local_now = datetime.now().astimezone()
+    return market_open, local_now, us_now
 
 # ----------------- RUN ----------------------
 if __name__ == "__main__":
