@@ -261,6 +261,37 @@ def fetch_sentiment_china_news():
         print(f"Error during China sentiment classification: {e}")
         return 0.0
 
+def fetch_sentiment_india_news():
+    headlines = []
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    news_sources = [
+        {"url": "https://economictimes.indiatimes.com/markets", "tag": "a"},
+        {"url": "https://www.moneycontrol.com/news/business/markets/", "tag": "a"},
+        {"url": "https://www.livemint.com/market", "tag": "a"},
+        {"url": "https://www.business-standard.com/markets", "tag": "a"},
+        {"url": "https://www.financialexpress.com/market/", "tag": "a"},
+    ]
+    for source in news_sources:
+        try:
+            r = requests.get(source["url"], headers=headers, timeout=10)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            tags = soup.find_all(source["tag"], limit=2)
+            headlines += [tag.get_text(strip=True) for tag in tags if tag.get_text(strip=True)]
+        except Exception as e:
+            print(f"Error fetching {source['url']}: {e}")
+            continue
+    if not headlines:
+        print("No India headlines found. Returning neutral sentiment (0).")
+        return 0.0
+    try:
+        results = classifier(headlines)
+        score_map = {'Positive': 1, 'Neutral': 0, 'Negative': -1}
+        scores = [score_map[r['label']] for r in results]
+        return np.mean(scores)
+    except Exception as e:
+        print(f"Error during India sentiment classification: {e}")
+        return 0.0
+
 # In fetch_sentiment_finbert, call fetch_sentiment_china_news() and combine with global sentiment
 old_fetch_sentiment_finbert = fetch_sentiment_finbert
 
@@ -412,17 +443,27 @@ def is_market_open():
     return is_weekday and open_time <= us_now.time() <= close_time
 
 def get_us_eastern_time_online():
+    # Try multiple sources for US/Eastern time, fallback to local system time
     try:
         r = requests.get('http://worldtimeapi.org/api/timezone/America/New_York', timeout=5)
         if r.status_code == 200:
             data = r.json()
             dt_str = data['datetime']
-            # Example: '2025-07-04T10:15:30.123456-04:00'
             from dateutil import parser
             return parser.isoparse(dt_str)
     except Exception as e:
-        print(f"[Time API Error] {e}")
-    # Fallback to local system time if API fails
+        print(f"[Time API Error: worldtimeapi.org] {e}")
+    # Try secondary API
+    try:
+        r = requests.get('https://timeapi.io/api/Time/current/zone?timeZone=America/New_York', timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            # Example: {'dateTime': '2025-07-05T10:15:30'}
+            from dateutil import parser
+            return parser.isoparse(data['dateTime'])
+    except Exception as e:
+        print(f"[Time API Error: timeapi.io] {e}")
+    # Fallback to local system time if all APIs fail
     eastern = pytz.timezone('US/Eastern')
     return datetime.now(eastern)
 
@@ -1165,3 +1206,4 @@ if __name__ == "__main__":
     threading.Thread(target=update_nifty_data, daemon=True).start()
     run_after_hours_analysis()  # Start the after-hours analysis thread
     app.run(debug=True, port=8050)
+
