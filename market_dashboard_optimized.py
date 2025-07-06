@@ -12,6 +12,7 @@ from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import threading
 import time
+import os
 from datetime import datetime, timedelta
 import pytz
 import requests
@@ -39,7 +40,9 @@ class OptimizedDataStore:
         with self._lock:
             # Only update if we have new data
             if (len(timestamps) > 0 and 
-                (self.last_update is None or timestamps[-1] > self.last_update)):
+                (self.last_update is None or 
+                 (isinstance(timestamps[-1], (str, pd.Timestamp)) and 
+                  pd.to_datetime(timestamps[-1]) > pd.to_datetime(self.last_update)))):
                 
                 # Convert to lists and add to deques
                 self.timestamps.extend(timestamps)
@@ -47,7 +50,9 @@ class OptimizedDataStore:
                 self.predicted.extend(predicted)
                 self.sentiment_score.extend(sentiment_score)
                 
-                self.last_update = timestamps[-1] if timestamps else None
+                # Update last_update with the latest timestamp
+                if timestamps:
+                    self.last_update = pd.to_datetime(timestamps[-1])
                 logger.info(f"Updated data store with {len(timestamps)} new points")
     
     def get_recent_data(self, days=7):
@@ -64,9 +69,12 @@ class OptimizedDataStore:
                 'sentiment_score': list(self.sentiment_score)
             })
             
+            # Ensure timestamp column is datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
             # Filter to last N days
-            cutoff_date = datetime.now() - timedelta(days=days)
-            df = df[pd.to_datetime(df['timestamp']) >= cutoff_date]
+            cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=days)
+            df = df[df['timestamp'] >= cutoff_date]
             
             return (list(df['timestamp']), list(df['actual']), 
                    list(df['predicted']), list(df['sentiment_score']))
@@ -94,13 +102,31 @@ def fetch_api_data_with_cache(endpoint, cache_duration=30):
             # Check if response is valid JSON
             try:
                 data = r.json()
-                # Convert timestamps to pandas datetime if needed
-                if 'timestamps' in data:
-                    data['timestamps'] = pd.to_datetime(data['timestamps'])
                 
-                # Cache the result
-                setattr(fetch_api_data_with_cache, cache_key, (data, current_time))
-                return data
+                # Validate data structure and clean NaN values
+                if isinstance(data, dict) and 'timestamps' in data:
+                    # Convert timestamps to pandas datetime if needed
+                    if data['timestamps']:
+                        data['timestamps'] = pd.to_datetime(data['timestamps'])
+                    
+                    # Clean NaN values from numeric fields
+                    for field in ['actual', 'predicted', 'sentiment_score']:
+                        if field in data and data[field]:
+                            # Replace NaN with None or 0
+                            cleaned_values = []
+                            for val in data[field]:
+                                if pd.isna(val) or val is None:
+                                    cleaned_values.append(0.0)
+                                else:
+                                    cleaned_values.append(float(val))
+                            data[field] = cleaned_values
+                    
+                    # Cache the result
+                    setattr(fetch_api_data_with_cache, cache_key, (data, current_time))
+                    return data
+                else:
+                    logger.warning(f"Invalid data structure from API: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+                    return None
             except ValueError as json_error:
                 logger.error(f"Invalid JSON response from API: {r.text[:100]}...")
                 return None
@@ -115,27 +141,35 @@ def efficient_csv_loader():
     """Load data from CSV files efficiently with error handling"""
     try:
         # Load S&P 500 data
-        df_sp500 = pd.read_csv('dashboard_data.csv', parse_dates=['timestamp'])
-        if not df_sp500.empty:
-            sp500_store.update_data(
-                df_sp500['timestamp'].tolist(),
-                df_sp500['actual'].tolist(),
-                df_sp500['predicted'].tolist(),
-                df_sp500['sentiment_score'].tolist()
-            )
+        if os.path.exists('dashboard_data.csv'):
+            df_sp500 = pd.read_csv('dashboard_data.csv', parse_dates=['timestamp'])
+            if not df_sp500.empty:
+                sp500_store.update_data(
+                    df_sp500['timestamp'].tolist(),
+                    df_sp500['actual'].tolist(),
+                    df_sp500['predicted'].tolist(),
+                    df_sp500['sentiment_score'].tolist()
+                )
+                logger.info(f"Loaded {len(df_sp500)} S&P 500 data points from CSV")
+        else:
+            logger.warning("dashboard_data.csv not found")
     except Exception as e:
         logger.warning(f"Could not load S&P 500 CSV: {e}")
     
     try:
         # Load NIFTY data
-        df_nifty = pd.read_csv('dashboard_data_nifty.csv', parse_dates=['timestamp'])
-        if not df_nifty.empty:
-            nifty_store.update_data(
-                df_nifty['timestamp'].tolist(),
-                df_nifty['actual'].tolist(),
-                df_nifty['predicted'].tolist(),
-                df_nifty['sentiment_score'].tolist()
-            )
+        if os.path.exists('dashboard_data_nifty.csv'):
+            df_nifty = pd.read_csv('dashboard_data_nifty.csv', parse_dates=['timestamp'])
+            if not df_nifty.empty:
+                nifty_store.update_data(
+                    df_nifty['timestamp'].tolist(),
+                    df_nifty['actual'].tolist(),
+                    df_nifty['predicted'].tolist(),
+                    df_nifty['sentiment_score'].tolist()
+                )
+                logger.info(f"Loaded {len(df_nifty)} NIFTY data points from CSV")
+        else:
+            logger.warning("dashboard_data_nifty.csv not found")
     except Exception as e:
         logger.warning(f"Could not load NIFTY CSV: {e}")
 
@@ -146,32 +180,44 @@ def periodic_data_update():
             # Try API first, fallback to CSV
             sp500_api_data = fetch_api_data_with_cache('sp500')
             if sp500_api_data and sp500_api_data.get('timestamps'):
-                sp500_store.update_data(
-                    sp500_api_data['timestamps'],
-                    sp500_api_data['actual'],
-                    sp500_api_data['predicted'],
-                    sp500_api_data['sentiment_score']
-                )
+                try:
+                    sp500_store.update_data(
+                        sp500_api_data['timestamps'],
+                        sp500_api_data['actual'],
+                        sp500_api_data['predicted'],
+                        sp500_api_data['sentiment_score']
+                    )
+                except Exception as e:
+                    logger.error(f"Error updating S&P 500 data: {e}")
             else:
                 logger.info("No S&P 500 API data available, using CSV fallback")
             
             nifty_api_data = fetch_api_data_with_cache('nifty')
             if nifty_api_data and nifty_api_data.get('timestamps'):
-                nifty_store.update_data(
-                    nifty_api_data['timestamps'],
-                    nifty_api_data['actual'],
-                    nifty_api_data['predicted'],
-                    nifty_api_data['sentiment_score']
-                )
+                try:
+                    nifty_store.update_data(
+                        nifty_api_data['timestamps'],
+                        nifty_api_data['actual'],
+                        nifty_api_data['predicted'],
+                        nifty_api_data['sentiment_score']
+                    )
+                except Exception as e:
+                    logger.error(f"Error updating NIFTY data: {e}")
             else:
                 logger.info("No NIFTY API data available, using CSV fallback")
             
             # Always load from CSV as fallback
-            efficient_csv_loader()
+            try:
+                efficient_csv_loader()
+            except Exception as e:
+                logger.error(f"Error in CSV loader: {e}")
                 
         except Exception as e:
             logger.error(f"Error in periodic update: {e}")
-            efficient_csv_loader()
+            try:
+                efficient_csv_loader()
+            except Exception as csv_error:
+                logger.error(f"Error in CSV fallback: {csv_error}")
         
         time.sleep(60)  # Reduced frequency from 30s to 60s
 

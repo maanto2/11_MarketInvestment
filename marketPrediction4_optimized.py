@@ -34,8 +34,8 @@ import functools
 import logging
 import concurrent.futures
 from collections import deque
-# import asyncio
-# import aiohttp
+import asyncio
+import aiohttp
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
